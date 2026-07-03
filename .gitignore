@@ -1,0 +1,10 @@
+build/
+out/
+.vs/
+.cache/
+CMakeUserPresets.json
+*.user
+*.suo
+Testing/
+gst-bundle/
+third_party/asiosdk/
