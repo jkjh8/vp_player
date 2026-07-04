@@ -143,10 +143,19 @@ bool PlayerCore::Init(HWND video_hwnd, FeedbackFn feedback) {
   amix_ = MakeElement("audiomixer", "amix");
   GstElement* aconv = MakeElement("audioconvert", "aconv_out");
   GstElement* ares = MakeElement("audioresample", "ares_out");
+  audio_tail_ = ares;
   audio_sink_ = MakeElement("wasapi2sink", "asink");
   if (!audio_sink_) {
     audio_sink_ = MakeElement("autoaudiosink", "asink");
     feedback_("warn", "wasapi2sink unavailable — falling back to autoaudiosink");
+  }
+
+  // 시스템 클록 고정: 오디오 sink를 라이브 교체(set_audio_device)해도 파이프라인
+  // 클록이 흔들리지 않게 함 (Phase 3 멀티 sink/ASIO 전환의 전제이기도 함)
+  {
+    GstClock* sysclock = gst_system_clock_obtain();
+    gst_pipeline_use_clock(GST_PIPELINE(pipeline_), sysclock);
+    gst_object_unref(sysclock);
   }
 
   // 배경색 브랜치 (라이브 소스 = 덱이 없어도 컴포지터가 항상 출력)
@@ -738,7 +747,11 @@ void PlayerCore::SwapTo(Deck* deck) {
   json changed = {{"idx", deck->id}};
   if (deck->file.contains("uuid")) changed["uuid"] = deck->file["uuid"];
   if (deck->file.contains("path")) changed["path"] = deck->file["path"];
-  if (deck->track_idx >= 0) changed["playlist_track_index"] = deck->track_idx;
+  if (deck->track_idx >= 0) {
+    changed["playlist_track_index"] = deck->track_idx;
+    track_index_ = deck->track_idx;
+    feedback_("track_index", deck->track_idx);  // parser → pStatus.playlistTrackIndex
+  }
   feedback_("media_changed", changed);
 }
 
@@ -803,13 +816,21 @@ void PlayerCore::PreloadNext(const json& file, int track_idx, double image_time_
 }
 
 bool PlayerCore::Next() {
-  if (standby_deck_ < 0 || !decks_[standby_deck_] ||
-      decks_[standby_deck_]->state != Deck::State::Prerolled) {
-    feedback_("warn", "next: no preloaded deck");
-    return false;
+  if (standby_deck_ >= 0 && decks_[standby_deck_] &&
+      decks_[standby_deck_]->state == Deck::State::Prerolled) {
+    SwapTo(decks_[standby_deck_].get());
+    return true;
   }
-  SwapTo(decks_[standby_deck_].get());
-  return true;
+  // 폴백: 프리로드된 덱이 없으면 내부 tracks_로 다음 트랙 직접 재생 (레거시 경로와 동일)
+  const int n = static_cast<int>(tracks_.size());
+  if (n > 0) {
+    const int cur = (live_deck_ >= 0 && decks_[live_deck_] && decks_[live_deck_]->track_idx >= 0)
+                        ? decks_[live_deck_]->track_idx
+                        : track_index_;
+    return PlayTrackIndex((cur + 1) % n);
+  }
+  feedback_("warn", "next: no preloaded deck and no tracks");
+  return false;
 }
 
 void PlayerCore::Play() {
@@ -955,10 +976,89 @@ json PlayerCore::ListAudioDevices() {
 }
 
 void PlayerCore::SetAudioDevice(const std::string& device_id) {
-  // wasapi2sink의 device 속성은 READY 이하에서만 반영됨 — 현 단계에서는 저장 후
-  // 다음 파이프라인 기동 시 적용. TODO(오디오): AudioOutput 팩토리에서 무중단 전환 구현.
-  if (audio_sink_) g_object_set(audio_sink_, "device", device_id.c_str(), nullptr);
-  feedback_("info", "audio device stored (applied on next start): " + device_id);
+  // 라이브 전환: audio_tail_(audioresample) src 패드의 IDLE 프로브에서 sink를 통째로
+  // 교체 — 패드가 push 중이 아닐 때 콜백이 실행되므로 in-flight 버퍼가 죽은 sink에서
+  // FLUSHING을 받아 aggregator 태스크가 영구 정지하는 문제를 회피 (GStreamer 공식
+  // dynamic-pipelines 레시피). wasapi2sink의 device 속성은 READY 이하에서만 반영됨.
+  if (!audio_tail_ || !audio_sink_) return;
+
+  struct Ctx {
+    PlayerCore* core;
+    std::string device;
+  };
+  auto* ctx = new Ctx{this, device_id};
+
+  GstPad* src = gst_element_get_static_pad(audio_tail_, "src");
+  gst_pad_add_probe(
+      src, GST_PAD_PROBE_TYPE_IDLE,
+      [](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
+        auto* c = static_cast<Ctx*>(data);
+        c->core->DoAudioSinkSwap(c->device);
+        return GST_PAD_PROBE_REMOVE;
+      },
+      ctx, [](gpointer data) { delete static_cast<Ctx*>(data); });
+  gst_object_unref(src);
+}
+
+void PlayerCore::DoAudioSinkSwap(const std::string& device_id) {
+  // 스트리밍 스레드에서 호출될 수 있음 — 상태 변경은 말단 sink에 한정(교착 없음),
+  // 피드백만 메인루프로 마샬링
+  gst_element_set_locked_state(audio_sink_, TRUE);
+  gst_element_set_state(audio_sink_, GST_STATE_NULL);
+  gst_element_unlink(audio_tail_, audio_sink_);
+  gst_bin_remove(GST_BIN(pipeline_), audio_sink_);  // unref 포함
+
+  audio_sink_ = MakeElement("wasapi2sink", "asink");
+  if (!audio_sink_) audio_sink_ = MakeElement("autoaudiosink", "asink");
+  if (!device_id.empty() &&
+      g_object_class_find_property(G_OBJECT_GET_CLASS(audio_sink_), "device")) {
+    g_object_set(audio_sink_, "device", device_id.c_str(), nullptr);
+  }
+  gst_bin_add(GST_BIN(pipeline_), audio_sink_);
+  const bool ok = gst_element_link(audio_tail_, audio_sink_);
+  gst_element_sync_state_with_parent(audio_sink_);
+
+  const std::string label = device_id.empty() ? "default" : device_id;
+  InvokeOnMain([this, ok, label] {
+    if (ok) {
+      feedback_("info", "audio device applied: " + label);
+    } else {
+      feedback_("error", "audio device switch failed: " + label);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 레거시 트랙 경로 (set_tracks/previous/playlist_play) + next 폴백
+// ---------------------------------------------------------------------------
+
+void PlayerCore::SetTracks(const json& tracks) {
+  tracks_ = tracks.is_array() ? tracks : json::array();
+  feedback_("debug", "tracks set: " + std::to_string(tracks_.size()));
+}
+
+bool PlayerCore::PlayTrackIndex(int idx) {
+  const int n = static_cast<int>(tracks_.size());
+  if (n == 0 || idx < 0 || idx >= n) {
+    feedback_("error", "playlist_play: index out of range: " + std::to_string(idx));
+    return false;
+  }
+  track_index_ = idx;
+  const json& file = tracks_[idx];
+  PlayFile(file, idx, file.value("time", 0.0));
+  return true;
+}
+
+void PlayerCore::Previous() {
+  const int n = static_cast<int>(tracks_.size());
+  if (n == 0) {
+    feedback_("warn", "previous: no tracks set");
+    return;
+  }
+  const int cur = (live_deck_ >= 0 && decks_[live_deck_] && decks_[live_deck_]->track_idx >= 0)
+                      ? decks_[live_deck_]->track_idx
+                      : track_index_;
+  PlayTrackIndex((cur - 1 + n) % n);  // 0 미만이면 마지막 트랙으로 순환 (프로토콜 §previous)
 }
 
 void PlayerCore::EmitTick() {

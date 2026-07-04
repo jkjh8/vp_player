@@ -72,10 +72,13 @@ scripts/              (예정) GStreamer 플러그인 번들링, ASIO 플러그�
 
 ## 로드맵 (요약)
 
-- [ ] **스파이크**: 단일 파일 재생(playbin3) + NDJSON 서버 + 100ms 틱 ← 현재
-- [ ] 듀얼 덱 + d3d11compositor 갭리스 전환
-- [ ] 이미지 스틸/타이머, 로고(PNG+SVG), 배경색, 풀스크린
-- [ ] 오디오 디바이스(WASAPI) 열람/선택, ASIO 플러그인 빌드
-- [ ] 트랜스크립트 리플레이 테스트 그린
-- [ ] 플러그인 번들 프루닝 + vp_app2 패키징 통합
+- [x] 스파이크: 재생 + NDJSON 서버 + 100ms 틱 + 한글 파일명
+- [x] 듀얼 덱 + d3d11compositor 갭리스 전환 (A/B 스왑 PASS)
+- [x] 이미지 스틸/타이머, 로고(PNG+SVG), 배경색, 풀스크린
+- [x] 오디오 디바이스(wasapi2) 열람 + 라이브 전환, 레거시 트랙 경로(previous/playlist_play)
+- [x] vp_app2 실연동 E2E (VP_PLAYER_ENGINE=native)
+- [x] 자립 번들 (`scripts\bundle.ps1` → dist/player ~45MB, GStreamer 미설치 환경 검증)
+- [ ] ASIO 플러그인 빌드 (gstasio.dll — Steinberg SDK 필요)
+- [ ] vp_app2 electron-builder 패키징 통합 + 설치본 크기 측정
+- [ ] 트랜스크립트 리플레이 테스트
 - [ ] (Phase 3) 타임라인 스케줄러, 멀티채널 mix-matrix(WASAPI 8ch / ASIO 드라이버 채널수), 독립 오디오 트랙

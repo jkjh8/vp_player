@@ -48,7 +48,14 @@ class PlayerCore {
 
   void SetBackgroundColor(uint32_t rgb);              // 0xRRGGBB
   nlohmann::json ListAudioDevices();                  // wasapi2 프로바이더만
-  void SetAudioDevice(const std::string& device_id);
+  void SetAudioDevice(const std::string& device_id);  // 라이브 전환 (sink 교체)
+
+  // 레거시 호환 경로 (프로토콜 §2: 현재 호스트 미사용이나 호환성 유지) + prev/next 폴백
+  void SetPlaylistMode(bool on) { playlist_mode_ = on; }
+  void SetTracks(const nlohmann::json& tracks);
+  void SetTrackIndex(int idx) { track_index_ = idx; }
+  bool PlayTrackIndex(int idx);  // 내부 tracks_ 기반 재생
+  void Previous();               // track_index-1 (음수면 마지막으로 순환)
 
   // 로고 오버레이 (PNG/JPG = stb_image, SVG = lunasvg). 실제 표시 여부 =
   // 사용자 설정(show_logo) AND 미디어 규칙(이미지/비디오=숨김, 오디오/정지=표시)
@@ -72,6 +79,7 @@ class PlayerCore {
   void PushLogoBuffer(int w, int h, const uint8_t* rgba);  // rgba 복사됨
   void ApplyLogoGeometry();
   void UpdateLogoVisibility(bool emit_feedback);
+  void DoAudioSinkSwap(const std::string& device_id);  // IDLE 프로브 콜백에서 실행
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static GstBusSyncReply OnBusSync(GstBus* bus, GstMessage* msg, gpointer user_data);
@@ -83,9 +91,14 @@ class PlayerCore {
   GstElement* pipeline_ = nullptr;
   GstElement* comp_ = nullptr;       // d3d11compositor (폴백: compositor)
   GstElement* amix_ = nullptr;       // audiomixer
+  GstElement* audio_tail_ = nullptr; // 출력단 audioresample (sink 교체 시 재연결 지점)
   GstElement* audio_sink_ = nullptr; // wasapi2sink (폴백: autoaudiosink)
   GstElement* bg_src_ = nullptr;     // videotestsrc solid-color
   bool use_d3d11_ = true;
+
+  nlohmann::json tracks_ = nlohmann::json::array();  // set_tracks 사본 (레거시/폴백용)
+  bool playlist_mode_ = false;
+  int track_index_ = 0;
 
   std::unique_ptr<Deck> decks_[2];
   int live_deck_ = -1;     // 현재 화면/소리를 점유한 덱 id

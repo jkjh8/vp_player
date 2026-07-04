@@ -80,7 +80,7 @@ void HandleCommand(const json& msg) {
   } else if (cmd == "next") {
     core.Next();
   } else if (cmd == "previous") {
-    SendFeedback("warn", "previous: not implemented yet (host should send playid)");
+    core.Previous();
   } else if (cmd == "play") {
     core.Play();
   } else if (cmd == "pause") {
@@ -113,10 +113,16 @@ void HandleCommand(const json& msg) {
     SendFeedback("audiodevices", json{{"devices", core.ListAudioDevices()}});
   } else if (cmd == "set_audio_device") {
     core.SetAudioDevice(msg.value("device_id", ""));
-  } else if (cmd == "playlist_mode" || cmd == "set_tracks" || cmd == "set_track_index" ||
-             cmd == "playlist_play") {
-    // 트랙 시퀀싱은 호스트(parser.js) 책임 — 수신만 확인
-    SendFeedback("debug", "ack: " + cmd);
+  } else if (cmd == "playlist_mode") {
+    core.SetPlaylistMode(msg.value("value", false));
+    SendFeedback("debug", "ack: playlist_mode");
+  } else if (cmd == "set_tracks") {
+    core.SetTracks(msg.value("tracks", json::array()));
+  } else if (cmd == "set_track_index") {
+    core.SetTrackIndex(msg.value("index", 0));
+    SendFeedback("debug", "ack: set_track_index");
+  } else if (cmd == "playlist_play") {
+    core.PlayTrackIndex(msg.value("idx", 0));
   } else if (cmd == "show_logo") {
     core.SetLogoEnabled(msg.value("show", false));
   } else if (cmd == "logo_file") {
@@ -152,19 +158,21 @@ gboolean SendReady(gpointer) {
 // ---------- 번들 GStreamer 격리 (배포 시) ----------
 
 void ConfigureBundledGStreamer() {
+  // 번들 레이아웃: <exe폴더>\*.dll (코어 라이브러리) + <exe폴더>\gst-plugins\*.dll
+  // 코어 DLL은 exe 옆이라 로더가 자동 탐색 — 플러그인 경로/레지스트리만 격리하면 됨
   wchar_t exe_path[MAX_PATH];
   GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-  const auto bundle = std::filesystem::path(exe_path).parent_path() / L"gst-bundle";
-  if (!std::filesystem::exists(bundle / L"plugins")) return;  // 개발 환경: 시스템 GStreamer 사용
+  const auto plugins = std::filesystem::path(exe_path).parent_path() / L"gst-plugins";
+  if (!std::filesystem::exists(plugins)) return;  // 개발 환경: 시스템 GStreamer 사용
 
-  _wputenv_s(L"GST_PLUGIN_PATH", (bundle / L"plugins").c_str());
+  _wputenv_s(L"GST_PLUGIN_PATH", plugins.c_str());
   _wputenv_s(L"GST_PLUGIN_SYSTEM_PATH_1_0", L"");
   wchar_t local_appdata[MAX_PATH];
   if (GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH) > 0) {
     const auto registry = std::filesystem::path(local_appdata) / L"vpapp" / L"gst-registry.bin";
+    std::filesystem::create_directories(registry.parent_path());
     _wputenv_s(L"GST_REGISTRY_1_0", registry.c_str());
   }
-  SetDllDirectoryW(bundle.c_str());
 }
 
 }  // namespace
