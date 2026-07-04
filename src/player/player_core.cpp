@@ -1,10 +1,21 @@
 #include "player/player_core.h"
 
+#include <gst/app/gstappsrc.h>
 #include <gst/video/videooverlay.h>
 
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <optional>
+#include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#include <stb_image.h>
+
+#include <lunasvg.h>
 
 namespace vp {
 
@@ -95,6 +106,13 @@ struct PlayerCore::Deck {
   guint preroll_watch = 0;
   GstClockTime preroll_started = 0;
   GstClockTime paused_running = GST_CLOCK_TIME_NONE;  // Pause 시점 러닝타임 (재개 보정용)
+
+  // 이미지 스틸: imagefreeze는 EOS를 내지 않으므로 표시 시간은 타이머가 담당
+  bool is_image = false;
+  gint64 image_time_ms = 0;                // 0 = 무한 표시
+  guint image_timer = 0;                   // g_timeout 소스 id
+  GstClockTime image_started = 0;          // 라이브 시작(또는 재개) 시점 러닝타임
+  gint64 image_elapsed_ms = 0;             // 일시정지 누적 경과
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +213,8 @@ bool PlayerCore::Init(HWND video_hwnd, FeedbackFn feedback) {
     }
   }
 
+  if (!InitLogoBranch()) return false;
+
   GstBus* bus = gst_element_get_bus(pipeline_);
   gst_bus_set_sync_handler(bus, OnBusSync, this, nullptr);
   gst_bus_add_watch(bus, OnBusMessage, this);
@@ -205,6 +225,140 @@ bool PlayerCore::Init(HWND video_hwnd, FeedbackFn feedback) {
     return false;
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// 로고 오버레이 — appsrc에 RGBA 버퍼 1장 push, videoaggregator가 마지막 프레임을
+// 유지하므로 정적 로고는 push 1회로 충분. 교체 = caps 변경 후 새 버퍼 push.
+// ---------------------------------------------------------------------------
+
+bool PlayerCore::InitLogoBranch() {
+  logo_src_ = MakeElement("appsrc", "logo_src");
+  // PTS는 push 시 수동 지정 (do-timestamp는 기동 전 push 버퍼에 무효 타임스탬프).
+  // max-latency=-1 필수: 기본값 0이면 컴포지터 레이턴시 협상이 bg(live, min 16.7ms)와
+  // 모순(max 0 < min)이 되어 CORE/CLOCK 경고가 폭주함 (aggregator 레이턴시 실측 확인)
+  g_object_set(logo_src_, "is-live", TRUE, "do-timestamp", FALSE, "format", GST_FORMAT_TIME,
+               "min-latency", (gint64)0, "max-latency", (gint64)-1, nullptr);
+  GstElement* logo_queue = MakeElement("queue", "logo_queue");
+  GstElement* upload = use_d3d11_ ? MakeElement("d3d11upload", "logo_upload") : nullptr;
+
+  gst_bin_add_many(GST_BIN(pipeline_), logo_src_, logo_queue, nullptr);
+  if (upload) gst_bin_add(GST_BIN(pipeline_), upload);
+
+  GstElement* tail = upload ? upload : logo_queue;
+  bool link_ok = gst_element_link(logo_src_, logo_queue);
+  if (upload) link_ok = link_ok && gst_element_link(logo_queue, upload);
+  if (!link_ok) {
+    feedback_("error", "logo: link failed");
+    return false;
+  }
+  GstPad* src = gst_element_get_static_pad(tail, "src");
+  logo_pad_ = gst_element_request_pad_simple(comp_, "sink_%u");
+  g_object_set(logo_pad_, "zorder", (guint)100, "alpha", 0.0, nullptr);
+  const bool ok = gst_pad_link(src, logo_pad_) == GST_PAD_LINK_OK;
+  gst_object_unref(src);
+  if (!ok) {
+    feedback_("error", "logo: link to compositor failed");
+    return false;
+  }
+
+  // 초기 1x1 투명 버퍼 (컴포지터 패드 협상용)
+  const uint8_t transparent[4] = {0, 0, 0, 0};
+  logo_img_w_ = 1;
+  logo_img_h_ = 1;
+  PushLogoBuffer(1, 1, transparent);
+  return true;
+}
+
+void PlayerCore::PushLogoBuffer(int w, int h, const uint8_t* rgba) {
+  GstCaps* caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "RGBA", "width",
+                                      G_TYPE_INT, w, "height", G_TYPE_INT, h, "framerate",
+                                      GST_TYPE_FRACTION, 0, 1, nullptr);
+  gst_app_src_set_caps(GST_APP_SRC(logo_src_), caps);
+  gst_caps_unref(caps);
+
+  const size_t size = static_cast<size_t>(w) * h * 4;
+  GstBuffer* buf = gst_buffer_new_allocate(nullptr, size, nullptr);
+  gst_buffer_fill(buf, 0, rgba, size);
+
+  // PTS = 현재 러닝타임 (기동 전이면 0) — 컴포지터는 패드별 마지막 버퍼를 유지하므로
+  // 순서만 맞으면 됨
+  GstState state = GST_STATE_NULL;
+  gst_element_get_state(pipeline_, &state, nullptr, 0);
+  GST_BUFFER_PTS(buf) = (state == GST_STATE_PLAYING) ? RunningTime() : 0;
+  GST_BUFFER_DURATION(buf) = GST_CLOCK_TIME_NONE;
+
+  gst_app_src_push_buffer(GST_APP_SRC(logo_src_), buf);  // 소유권 이전
+}
+
+void PlayerCore::ApplyLogoGeometry() {
+  if (!logo_pad_ || logo_img_w_ <= 0 || logo_img_h_ <= 0) return;
+  int disp_w = logo_size_px_ > 0 ? logo_size_px_ : logo_img_w_;
+  int disp_h = disp_w * logo_img_h_ / logo_img_w_;
+  if (disp_w > kCanvasWidth) {
+    disp_w = kCanvasWidth;
+    disp_h = disp_w * logo_img_h_ / logo_img_w_;
+  }
+  if (disp_h > kCanvasHeight) {
+    disp_h = kCanvasHeight;
+    disp_w = disp_h * logo_img_w_ / logo_img_h_;
+  }
+  g_object_set(logo_pad_, "xpos", (kCanvasWidth - disp_w) / 2, "ypos",
+               (kCanvasHeight - disp_h) / 2, "width", disp_w, "height", disp_h, nullptr);
+}
+
+void PlayerCore::UpdateLogoVisibility(bool emit_feedback) {
+  const bool visible = logo_enabled_ && media_wants_logo_ && logo_loaded_;
+  if (logo_pad_) g_object_set(logo_pad_, "alpha", visible ? 1.0 : 0.0, nullptr);
+  if (emit_feedback) feedback_("logo_visibility", json{{"show", visible}});
+}
+
+void PlayerCore::SetLogoFile(const std::string& path) {
+  std::string ext = std::filesystem::path(path).extension().string();
+  for (auto& c : ext) c = static_cast<char>(tolower(c));
+
+  if (ext == ".svg") {
+    auto document = lunasvg::Document::loadFromFile(path);
+    if (!document) {
+      feedback_("error", "logo: failed to load svg: " + path);
+      return;
+    }
+    auto bitmap = document->renderToBitmap();  // 원본 크기, GPU가 표시 크기로 스케일
+    if (!bitmap.valid()) {
+      feedback_("error", "logo: failed to render svg: " + path);
+      return;
+    }
+    bitmap.convertToRGBA();
+    logo_img_w_ = static_cast<int>(bitmap.width());
+    logo_img_h_ = static_cast<int>(bitmap.height());
+    PushLogoBuffer(logo_img_w_, logo_img_h_, bitmap.data());
+  } else {
+    int w = 0, h = 0, n = 0;
+    stbi_uc* pixels = stbi_load(path.c_str(), &w, &h, &n, 4);
+    if (!pixels) {
+      feedback_("error", "logo: failed to load image: " + path);
+      return;
+    }
+    logo_img_w_ = w;
+    logo_img_h_ = h;
+    PushLogoBuffer(w, h, pixels);
+    stbi_image_free(pixels);
+  }
+
+  logo_loaded_ = true;
+  ApplyLogoGeometry();
+  UpdateLogoVisibility(/*emit_feedback=*/false);
+  feedback_("debug", "logo loaded: " + path);
+}
+
+void PlayerCore::SetLogoSize(int width_px) {
+  logo_size_px_ = width_px;
+  ApplyLogoGeometry();
+}
+
+void PlayerCore::SetLogoEnabled(bool show) {
+  logo_enabled_ = show;
+  UpdateLogoVisibility(/*emit_feedback=*/true);
 }
 
 void PlayerCore::Shutdown() {
@@ -282,14 +436,32 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
 
   if (is_video && !deck->video_tail) {
     GstElement* q = MakeElement("queue", nullptr);
+    // 이미지: 단일 프레임을 무한 반복 스트림으로 (표시 시간은 SwapTo의 타이머가 관리)
+    GstElement* freeze = deck->is_image ? MakeElement("imagefreeze", nullptr) : nullptr;
+    GstElement* freeze_caps = nullptr;
+    if (freeze) {
+      freeze_caps = MakeElement("capsfilter", nullptr);
+      GstCaps* caps = gst_caps_new_simple("video/x-raw", "framerate", GST_TYPE_FRACTION, 30, 1,
+                                          nullptr);
+      g_object_set(freeze_caps, "caps", caps, nullptr);
+      gst_caps_unref(caps);
+    }
     GstElement* upload = core->use_d3d11_ ? MakeElement("d3d11upload", nullptr) : nullptr;
     GstElement* convert = core->use_d3d11_ ? MakeElement("d3d11convert", nullptr)
                                            : MakeElement("videoconvert", nullptr);
 
     gst_bin_add_many(GST_BIN(deck->bin), q, convert, nullptr);
+    if (freeze) gst_bin_add_many(GST_BIN(deck->bin), freeze, freeze_caps, nullptr);
     if (upload) gst_bin_add(GST_BIN(deck->bin), upload);
-    bool ok = upload ? gst_element_link_many(q, upload, convert, nullptr)
-                     : gst_element_link(q, convert);
+
+    bool ok = true;
+    GstElement* chain_head = q;
+    if (freeze) {
+      ok = ok && gst_element_link_many(q, freeze, freeze_caps, nullptr);
+      chain_head = freeze_caps;
+    }
+    ok = ok && (upload ? gst_element_link_many(chain_head, upload, convert, nullptr)
+                       : gst_element_link(chain_head, convert));
     GstPad* qsink = gst_element_get_static_pad(q, "sink");
     ok = ok && gst_pad_link(pad, qsink) == GST_PAD_LINK_OK;
     gst_object_unref(qsink);
@@ -308,6 +480,10 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
         deck, nullptr);
 
     gst_element_sync_state_with_parent(q);
+    if (freeze) {
+      gst_element_sync_state_with_parent(freeze);
+      gst_element_sync_state_with_parent(freeze_caps);
+    }
     if (upload) gst_element_sync_state_with_parent(upload);
     gst_element_sync_state_with_parent(convert);
     if (!ok) InvokeOnMain([core] { core->feedback_("error", "deck: video branch link failed"); });
@@ -374,7 +550,7 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
 }
 
 PlayerCore::Deck* PlayerCore::BuildDeck(int deck_id, const json& file, int track_idx,
-                                        bool play_when_ready) {
+                                        bool play_when_ready, double image_time_s) {
   const std::string path = file.value("path", "");
   auto uri = ToUri(path);
   if (!uri) {
@@ -390,6 +566,11 @@ PlayerCore::Deck* PlayerCore::BuildDeck(int deck_id, const json& file, int track
   deck->file = file;
   deck->track_idx = track_idx;
   deck->play_when_ready = play_when_ready;
+  // is_image 판정: 명시 플래그 우선, 없으면 mimetype (프로토콜 §file 객체의 누락 모순은
+  // 호스트 측에서 정리하기로 함 — 여기서는 명시값만 신뢰)
+  deck->is_image = file.value("is_image", false) ||
+                   file.value("mimetype", std::string()).rfind("image/", 0) == 0;
+  deck->image_time_ms = static_cast<gint64>(image_time_s * 1000.0);
 
   deck->bin = gst_bin_new(deck_id == 0 ? "deck0" : "deck1");
   deck->decode = MakeElement("uridecodebin3", nullptr);
@@ -530,6 +711,29 @@ void PlayerCore::SwapTo(Deck* deck) {
   live_deck_ = deck->id;
   if (standby_deck_ == deck->id) standby_deck_ = -1;
 
+  // 이미지 표시 시간 타이머 (0 = 무한)
+  deck->image_started = offset;
+  deck->image_elapsed_ms = 0;
+  if (deck->is_image && deck->image_time_ms > 0) {
+    deck->image_timer = g_timeout_add(
+        static_cast<guint>(deck->image_time_ms),
+        [](gpointer data) -> gboolean {
+          auto* d = static_cast<Deck*>(data);
+          d->image_timer = 0;
+          if (d->state == Deck::State::Live && !d->eos_sent) {
+            d->eos_sent = true;
+            d->core->feedback_("end_reached", json{{"playlist_track_index", d->track_idx},
+                                                   {"active_player_id", d->id}});
+          }
+          return G_SOURCE_REMOVE;
+        },
+        deck);
+  }
+
+  // 로고 자동 표시 규칙: 이미지/비디오 = 숨김, 오디오 전용 = 표시 (§2.7)
+  media_wants_logo_ = (deck->video_tail == nullptr);
+  UpdateLogoVisibility(/*emit_feedback=*/true);
+
   feedback_("active_player_id", deck->id);
   json changed = {{"idx", deck->id}};
   if (deck->file.contains("uuid")) changed["uuid"] = deck->file["uuid"];
@@ -543,6 +747,10 @@ void PlayerCore::TeardownDeck(Deck* deck) {
   if (deck->preroll_watch) {
     g_source_remove(deck->preroll_watch);
     deck->preroll_watch = 0;
+  }
+  if (deck->image_timer) {
+    g_source_remove(deck->image_timer);
+    deck->image_timer = 0;
   }
   deck->state = Deck::State::Dead;
 
@@ -582,16 +790,16 @@ void PlayerCore::TeardownDeck(Deck* deck) {
 // 공개 명령
 // ---------------------------------------------------------------------------
 
-void PlayerCore::PlayFile(const json& file, int track_idx) {
+void PlayerCore::PlayFile(const json& file, int track_idx, double image_time_s) {
   // 라이브 덱과 다른 슬롯에 빌드 → 프리롤 완료 시 자동 스왑
   const int slot = (live_deck_ == 0) ? 1 : 0;
   if (standby_deck_ >= 0 && decks_[standby_deck_]) TeardownDeck(decks_[standby_deck_].get());
-  BuildDeck(slot, file, track_idx, /*play_when_ready=*/true);
+  BuildDeck(slot, file, track_idx, /*play_when_ready=*/true, image_time_s);
 }
 
-void PlayerCore::PreloadNext(const json& file, int track_idx) {
+void PlayerCore::PreloadNext(const json& file, int track_idx, double image_time_s) {
   const int slot = (live_deck_ == 0) ? 1 : 0;
-  BuildDeck(slot, file, track_idx, /*play_when_ready=*/false);
+  BuildDeck(slot, file, track_idx, /*play_when_ready=*/false, image_time_s);
 }
 
 bool PlayerCore::Next() {
@@ -624,6 +832,27 @@ void PlayerCore::Play() {
     gst_pad_remove_probe(deck->audio_out, deck->audio_block);
     deck->audio_block = 0;
   }
+
+  // 이미지 타이머 재개 (남은 시간만큼 재무장)
+  if (deck->is_image && deck->image_time_ms > 0 && !deck->eos_sent) {
+    deck->image_started = RunningTime();
+    const gint64 remain = deck->image_time_ms - deck->image_elapsed_ms;
+    if (remain > 0 && !deck->image_timer) {
+      deck->image_timer = g_timeout_add(
+          static_cast<guint>(remain),
+          [](gpointer data) -> gboolean {
+            auto* d = static_cast<Deck*>(data);
+            d->image_timer = 0;
+            if (d->state == Deck::State::Live && !d->eos_sent) {
+              d->eos_sent = true;
+              d->core->feedback_("end_reached", json{{"playlist_track_index", d->track_idx},
+                                                     {"active_player_id", d->id}});
+            }
+            return G_SOURCE_REMOVE;
+          },
+          deck);
+    }
+  }
   paused_ = false;
 }
 
@@ -646,6 +875,16 @@ void PlayerCore::Pause() {
         static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER),
         nullptr, nullptr, nullptr);
   }
+
+  // 이미지 타이머 일시정지 (경과 누적 후 해제)
+  if (deck->is_image) {
+    deck->image_elapsed_ms +=
+        static_cast<gint64>((RunningTime() - deck->image_started) / GST_MSECOND);
+    if (deck->image_timer) {
+      g_source_remove(deck->image_timer);
+      deck->image_timer = 0;
+    }
+  }
   paused_ = true;
 }
 
@@ -653,11 +892,18 @@ void PlayerCore::Stop() {
   if (live_deck_ >= 0 && decks_[live_deck_]) TeardownDeck(decks_[live_deck_].get());
   if (standby_deck_ >= 0 && decks_[standby_deck_]) TeardownDeck(decks_[standby_deck_].get());
   paused_ = false;
+  // 정지 → 로고 복귀 (프로토콜 §2.7: stop 후 logo_visibility {show:true} 필수)
+  media_wants_logo_ = true;
+  UpdateLogoVisibility(/*emit_feedback=*/true);
 }
 
 void PlayerCore::SeekMs(int64_t time_ms) {
   if (live_deck_ < 0 || !decks_[live_deck_]) return;
   Deck* deck = decks_[live_deck_].get();
+  if (deck->is_image) {
+    feedback_("debug", "set_time ignored for image");
+    return;
+  }
   GstPad* pad = deck->video_out ? deck->video_out : deck->audio_out;
   if (!pad) return;
 
@@ -721,12 +967,21 @@ void PlayerCore::EmitTick() {
   GstPad* pad = deck->video_out ? deck->video_out : deck->audio_out;
   if (!pad) return;
 
-  gint64 pos_ns = -1, dur_ns = -1;
-  gst_pad_query_position(pad, GST_FORMAT_TIME, &pos_ns);
-  gst_pad_query_duration(pad, GST_FORMAT_TIME, &dur_ns);
-
-  const gint64 time_ms = pos_ns >= 0 ? pos_ns / GST_MSECOND : 0;
-  const gint64 dur_ms = dur_ns >= 0 ? dur_ns / GST_MSECOND : 0;
+  gint64 time_ms = 0, dur_ms = 0;
+  if (deck->is_image) {
+    // 이미지: 타이머 기반 합성 (Python player와 동일 — 프로토콜 §3.4)
+    time_ms = deck->image_elapsed_ms +
+              (paused_ ? 0
+                       : static_cast<gint64>((RunningTime() - deck->image_started) / GST_MSECOND));
+    dur_ms = deck->image_time_ms;  // 0 = 무한
+    if (dur_ms > 0 && time_ms > dur_ms) time_ms = dur_ms;
+  } else {
+    gint64 pos_ns = -1, dur_ns = -1;
+    gst_pad_query_position(pad, GST_FORMAT_TIME, &pos_ns);
+    gst_pad_query_duration(pad, GST_FORMAT_TIME, &dur_ns);
+    time_ms = pos_ns >= 0 ? pos_ns / GST_MSECOND : 0;
+    dur_ms = dur_ns >= 0 ? dur_ns / GST_MSECOND : 0;
+  }
   const double position = dur_ms > 0 ? static_cast<double>(time_ms) / dur_ms : 0.0;
   const bool playing = !paused_;
 

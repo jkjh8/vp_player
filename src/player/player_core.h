@@ -36,9 +36,10 @@ class PlayerCore {
   void Shutdown();
 
   // file: 호스트가 주는 file 객체 (path 필수, uuid 등은 피드백에 반사)
-  void PlayFile(const nlohmann::json& file, int track_idx);     // 프리롤 완료 즉시 스왑
-  void PreloadNext(const nlohmann::json& file, int track_idx);  // 대기 덱 프리롤만
-  bool Next();                                                  // 프리롤된 대기 덱으로 스왑
+  // image_time_s: 이미지 표시 시간 (초, 0 = 무한) — is_image일 때만 의미
+  void PlayFile(const nlohmann::json& file, int track_idx, double image_time_s = 0.0);
+  void PreloadNext(const nlohmann::json& file, int track_idx, double image_time_s = 0.0);
+  bool Next();  // 프리롤된 대기 덱으로 스왑
 
   void Play();
   void Pause();
@@ -49,16 +50,28 @@ class PlayerCore {
   nlohmann::json ListAudioDevices();                  // wasapi2 프로바이더만
   void SetAudioDevice(const std::string& device_id);
 
+  // 로고 오버레이 (PNG/JPG = stb_image, SVG = lunasvg). 실제 표시 여부 =
+  // 사용자 설정(show_logo) AND 미디어 규칙(이미지/비디오=숨김, 오디오/정지=표시)
+  void SetLogoFile(const std::string& path);
+  void SetLogoSize(int width_px);   // 0 = 원본 크기
+  void SetLogoEnabled(bool show);   // show_logo 명령
+
   void EmitTick();  // 100ms 타이머에서 호출 — player_data 피드백
 
  private:
   struct Deck;
 
-  Deck* BuildDeck(int deck_id, const nlohmann::json& file, int track_idx, bool play_when_ready);
+  Deck* BuildDeck(int deck_id, const nlohmann::json& file, int track_idx, bool play_when_ready,
+                  double image_time_s);
   void SwapTo(Deck* deck);
   void TeardownDeck(Deck* deck);
   bool CheckPreroll(Deck* deck);  // 50ms 폴링 콜백 본체
   GstClockTime RunningTime() const;
+
+  bool InitLogoBranch();
+  void PushLogoBuffer(int w, int h, const uint8_t* rgba);  // rgba 복사됨
+  void ApplyLogoGeometry();
+  void UpdateLogoVisibility(bool emit_feedback);
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static GstBusSyncReply OnBusSync(GstBus* bus, GstMessage* msg, gpointer user_data);
@@ -78,6 +91,15 @@ class PlayerCore {
   int live_deck_ = -1;     // 현재 화면/소리를 점유한 덱 id
   int standby_deck_ = -1;  // 프리롤 중/완료된 대기 덱 id
   bool paused_ = false;
+
+  // 로고 오버레이 상태
+  GstElement* logo_src_ = nullptr;  // appsrc (RGBA) — 버퍼 1장 push, 컴포지터가 유지
+  GstPad* logo_pad_ = nullptr;      // comp 요청 패드 (zorder 최상위)
+  int logo_img_w_ = 0, logo_img_h_ = 0;
+  int logo_size_px_ = 0;            // 표시 폭 (0 = 원본)
+  bool logo_enabled_ = true;        // show_logo 사용자 설정
+  bool media_wants_logo_ = true;    // 미디어 규칙 (정지 상태 = 표시)
+  bool logo_loaded_ = false;
 };
 
 }  // namespace vp

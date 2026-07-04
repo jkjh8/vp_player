@@ -58,19 +58,24 @@ void HandleCommand(const json& msg) {
       SendFeedback("error", cmd + ": file missing");
       return;
     }
-    core.PlayFile(msg["file"], msg.value("track_idx", -1));
+    // 이미지 표시 시간: file.time (초, 0 = 무한) — 프로토콜 §file 객체
+    const double image_time = msg["file"].value("time", 0.0);
+    core.PlayFile(msg["file"], msg.value("track_idx", -1), image_time);
   } else if (cmd == "play_current_and_load_next") {
     const int track_idx = msg.value("track_idx", -1);
     if (msg.contains("current") && !msg["current"].is_null()) {
-      core.PlayFile(msg["current"], track_idx);
+      // current_time (초) 이 file.time 을 덮어씀 — 프로토콜 §2.5
+      const double t = msg.value("current_time", msg["current"].value("time", 0.0));
+      core.PlayFile(msg["current"], track_idx, t);
     }
     if (msg.contains("next") && !msg["next"].is_null()) {
-      core.PreloadNext(msg["next"], track_idx >= 0 ? track_idx + 1 : -1);
+      const double t = msg.value("next_time", msg["next"].value("time", 0.0));
+      core.PreloadNext(msg["next"], track_idx >= 0 ? track_idx + 1 : -1, t);
     }
-    // TODO(이미지): current_time/next_time — imagefreeze + 타이머 단계에서 처리
   } else if (cmd == "preload_next") {
     if (msg.contains("next") && !msg["next"].is_null()) {
-      core.PreloadNext(msg["next"], msg.value("next_track_idx", -1));
+      const double t = msg.value("next_time", msg["next"].value("time", 0.0));
+      core.PreloadNext(msg["next"], msg.value("next_track_idx", -1), t);
     }
   } else if (cmd == "next") {
     core.Next();
@@ -112,8 +117,12 @@ void HandleCommand(const json& msg) {
              cmd == "playlist_play") {
     // 트랙 시퀀싱은 호스트(parser.js) 책임 — 수신만 확인
     SendFeedback("debug", "ack: " + cmd);
-  } else if (cmd == "show_logo" || cmd == "logo_file" || cmd == "logo_size") {
-    SendFeedback("debug", cmd + ": logo overlay not implemented yet");
+  } else if (cmd == "show_logo") {
+    core.SetLogoEnabled(msg.value("show", false));
+  } else if (cmd == "logo_file") {
+    core.SetLogoFile(msg.value("file", ""));
+  } else if (cmd == "logo_size") {
+    core.SetLogoSize(msg.value("size", 0));
   } else {
     SendFeedback("debug", "unhandled command: " + cmd);
   }

@@ -31,15 +31,30 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
   gstreamer-video-1.0
   gstreamer-audio-1.0
   gstreamer-pbutils-1.0
+  gstreamer-app-1.0
 )
 
-# --- nlohmann/json (header-only, FetchContent) --------------------------------
+# --- 서드파티 (FetchContent) ---------------------------------------------------
 include(FetchContent)
+# CACHE FORCE: lunasvg 등 서브프로젝트의 option(BUILD_SHARED_LIBS ON)을 이기려면 캐시 변수여야 함
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(nlohmann_json
   URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
   URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
 )
-FetchContent_MakeAvailable(nlohmann_json)
+# 로고 래스터라이즈: SVG = lunasvg, PNG/JPG = stb_image
+FetchContent_Declare(lunasvg
+  GIT_REPOSITORY https://github.com/sammycage/lunasvg.git
+  GIT_TAG v2.4.1
+  GIT_SHALLOW TRUE
+)
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(nlohmann_json lunasvg stb)
 
 # --- vplayer ------------------------------------------------------------------
 add_executable(vplayer
@@ -50,10 +65,11 @@ add_executable(vplayer
   src/app.manifest
 )
 
-target_include_directories(vplayer PRIVATE src)
+target_include_directories(vplayer PRIVATE src "${stb_SOURCE_DIR}")
 target_link_libraries(vplayer PRIVATE
   PkgConfig::GST
   nlohmann_json::nlohmann_json
+  lunasvg
   ws2_32
 )
 
@@ -62,6 +78,7 @@ target_compile_definitions(vplayer PRIVATE
   WIN32_LEAN_AND_MEAN
   NOMINMAX
   UNICODE _UNICODE
+  LUNASVG_BUILD_STATIC  # lunasvg 정적 링크 (dllimport 데코 방지 — 그들의 define이 PRIVATE라 소비자가 직접 지정)
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
