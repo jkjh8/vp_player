@@ -6,11 +6,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- GStreamer (공식 MSVC devel MSI 필요) -----------------------------------
 # GSTREAMER_1_0_ROOT_MSVC_X86_64 환경변수(MSI 설치 시 자동 설정)로 pkg-config 구성
-if(DEFINED ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64})
-  file(TO_CMAKE_PATH "$ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64}" GST_ROOT)
+# 환경변수가 없어도 기본 설치 경로에서 GStreamer를 찾는다 (캐시 오염 방지: FORCE)
+set(_GST_CANDIDATES "$ENV{GSTREAMER_1_0_ROOT_MSVC_X86_64}"
+                    "C:/Program Files/gstreamer/1.0/msvc_x86_64" "C:/gstreamer/1.0/msvc_x86_64")
+foreach(_cand IN LISTS _GST_CANDIDATES)
+  if(_cand)
+    file(TO_CMAKE_PATH "${_cand}" _cand_cmake)
+    if(EXISTS "${_cand_cmake}/lib/pkgconfig/gstreamer-1.0.pc")
+      set(GST_ROOT "${_cand_cmake}")
+      break()
+    endif()
+  endif()
+endforeach()
+if(GST_ROOT)
   set(ENV{PKG_CONFIG_PATH} "${GST_ROOT}/lib/pkgconfig")
-  if(EXISTS "${GST_ROOT}/bin/pkg-config.exe" AND NOT DEFINED PKG_CONFIG_EXECUTABLE)
-    set(PKG_CONFIG_EXECUTABLE "${GST_ROOT}/bin/pkg-config.exe")
+  if(EXISTS "${GST_ROOT}/bin/pkg-config.exe")
+    set(PKG_CONFIG_EXECUTABLE "${GST_ROOT}/bin/pkg-config.exe" CACHE FILEPATH "" FORCE)
   endif()
 endif()
 
@@ -34,6 +45,8 @@ FetchContent_MakeAvailable(nlohmann_json)
 add_executable(vplayer
   src/main.cpp
   src/net/tcp_server.cpp
+  src/player/player_core.cpp
+  src/video/video_window.cpp
   src/app.manifest
 )
 
