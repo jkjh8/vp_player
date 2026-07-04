@@ -86,5 +86,28 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   # target_compile_options(vplayer PRIVATE /fsanitize=address)
 endif()
 
+# --- gstasio 플러그인 (third_party/gstasio 참조 — vendored, LGPL) ---------------
+# 공식 바이너리 미포함 플러그인을 함께 빌드해 번들. ASIO 디바이스 열람/출력용 (Phase 3 16ch).
+add_library(gstasio MODULE
+  third_party/gstasio/gstasiodeviceprovider.cpp
+  third_party/gstasio/gstasioobject.cpp
+  third_party/gstasio/gstasioringbuffer.cpp
+  third_party/gstasio/gstasiosink.cpp
+  third_party/gstasio/gstasiosrc.cpp
+  third_party/gstasio/gstasioutils.cpp
+  third_party/gstasio/plugin.c
+)
+set_target_properties(gstasio PROPERTIES PREFIX "")  # gstasio.dll (lib 접두어 방지)
+target_include_directories(gstasio PRIVATE third_party/gstasio)
+target_link_libraries(gstasio PRIVATE PkgConfig::GST avrt ole32)
+target_compile_options(gstasio PRIVATE /utf-8 /EHsc /FS)  # /FS: 병렬 빌드 PDB 충돌 방지
+target_compile_definitions(gstasio PRIVATE
+  # WIN32_LEAN_AND_MEAN 금지 — 플러그인이 windows.h 경유 OLE/COM 선언(CLSIDFromString 등)에 의존
+  PACKAGE="asio"
+  VERSION="1.26.11"
+  GST_PACKAGE_NAME="gst-plugins-bad-vendored"
+  GST_PACKAGE_ORIGIN="https://gstreamer.freedesktop.org"
+)
+
 # 실행 시 GStreamer bin의 DLL을 찾도록 개발 환경에서는 PATH에 %GSTREAMER%\bin 필요.
 # 배포 시에는 scripts/의 번들링 단계가 필요 DLL/플러그인을 gst-bundle/로 복사(추후 작성).

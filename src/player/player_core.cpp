@@ -3,6 +3,7 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/video/videooverlay.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <filesystem>
@@ -943,35 +944,62 @@ void PlayerCore::SetBackgroundColor(uint32_t rgb) {
   if (bg_src_) g_object_set(bg_src_, "foreground-color", (guint)(0xFF000000u | rgb), nullptr);
 }
 
+namespace {
+
+// 디바이스 caps에서 고정 채널 수 추출 (범위/미지정이면 0)
+int DeviceCapsChannels(GstDevice* dev) {
+  GstCaps* caps = gst_device_get_caps(dev);
+  if (!caps) return 0;
+  int channels = 0;
+  if (gst_caps_get_size(caps) > 0) {
+    gst_structure_get_int(gst_caps_get_structure(caps, 0), "channels", &channels);
+  }
+  gst_caps_unref(caps);
+  return channels;
+}
+
+// factory_name 프로바이더의 Audio/Sink 디바이스들을 devices 배열에 추가.
+// id_prop 값(없으면 이름)을 deviceId로 쓰고, 필요 시 id_prefix를 붙인다.
+void AppendProviderDevices(nlohmann::json& devices, const char* factory_name,
+                           const char* id_prop, const char* id_prefix, const char* type) {
+  GstDeviceProviderFactory* factory = gst_device_provider_factory_find(factory_name);
+  GstDeviceProvider* provider = factory ? gst_device_provider_factory_get(factory) : nullptr;
+  if (factory) gst_object_unref(factory);
+  if (!provider) return;
+
+  gst_device_provider_start(provider);
+  GList* list = gst_device_provider_get_devices(provider);
+  for (GList* it = list; it; it = it->next) {
+    GstDevice* dev = GST_DEVICE(it->data);
+    if (!gst_device_has_classes(dev, "Audio/Sink")) continue;
+    gchar* name = gst_device_get_display_name(dev);
+    GstStructure* props = gst_device_get_properties(dev);
+    const gchar* dev_id = props ? gst_structure_get_string(props, id_prop) : nullptr;
+    nlohmann::json entry = {
+        {"deviceId", std::string(id_prefix) + (dev_id ? dev_id : (name ? name : ""))},
+        {"name", name ? name : ""},
+        {"type", type}};
+    // 채널 수 정책: ASIO = 드라이버 보고값 그대로, WASAPI = 8ch 상한 (플랜 확정)
+    if (const int ch = DeviceCapsChannels(dev); ch > 0) {
+      entry["channels"] = (std::string(type) == "wasapi") ? std::min(ch, 8) : ch;
+    }
+    devices.push_back(std::move(entry));
+    if (props) gst_structure_free(props);
+    g_free(name);
+  }
+  g_list_free_full(list, gst_object_unref);
+  gst_device_provider_stop(provider);
+  gst_object_unref(provider);
+}
+
+}  // namespace
+
 json PlayerCore::ListAudioDevices() {
   json devices = json::array();
-
-  GstDeviceProviderFactory* factory =
-      gst_device_provider_factory_find("wasapi2deviceprovider");
-  GstDeviceProvider* provider =
-      factory ? gst_device_provider_factory_get(factory) : nullptr;
-  if (factory) gst_object_unref(factory);
-
-  if (provider) {
-    gst_device_provider_start(provider);
-    GList* list = gst_device_provider_get_devices(provider);
-    for (GList* it = list; it; it = it->next) {
-      GstDevice* dev = GST_DEVICE(it->data);
-      if (!gst_device_has_classes(dev, "Audio/Sink")) continue;
-      gchar* name = gst_device_get_display_name(dev);
-      GstStructure* props = gst_device_get_properties(dev);
-      const gchar* dev_id = props ? gst_structure_get_string(props, "device.id") : nullptr;
-      devices.push_back({{"deviceId", dev_id ? dev_id : (name ? name : "")},
-                         {"name", name ? name : ""},
-                         {"type", "wasapi"}});
-      if (props) gst_structure_free(props);
-      g_free(name);
-    }
-    g_list_free_full(list, gst_object_unref);
-    gst_device_provider_stop(provider);
-    gst_object_unref(provider);
-  }
-  // TODO(asio): gstasio.dll 번들 후 asiodeviceprovider 결과를 type:"asio"로 병합
+  AppendProviderDevices(devices, "wasapi2deviceprovider", "device.id", "", "wasapi");
+  // ASIO: deviceId = "asio:{CLSID}" — set_audio_device에서 접두어로 sink 종류 분기.
+  // 하드웨어가 연결된 드라이버만 나타남 (프로바이더가 드라이버 초기화에 성공해야 열람됨)
+  AppendProviderDevices(devices, "asiodeviceprovider", "device.clsid", "asio:", "asio");
   return devices;
 }
 
@@ -1008,12 +1036,21 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id) {
   gst_element_unlink(audio_tail_, audio_sink_);
   gst_bin_remove(GST_BIN(pipeline_), audio_sink_);  // unref 포함
 
-  audio_sink_ = MakeElement("wasapi2sink", "asink");
-  if (!audio_sink_) audio_sink_ = MakeElement("autoaudiosink", "asink");
-  if (!device_id.empty() &&
-      g_object_class_find_property(G_OBJECT_GET_CLASS(audio_sink_), "device")) {
-    g_object_set(audio_sink_, "device", device_id.c_str(), nullptr);
+  // deviceId 접두어로 sink 종류 분기: "asio:{CLSID}" = asiosink, 그 외 = wasapi2sink
+  if (device_id.rfind("asio:", 0) == 0) {
+    audio_sink_ = MakeElement("asiosink", "asink");
+    if (audio_sink_) {
+      // occupy-all-channels=false: 열려있는 출력 채널만 사용 (다른 채널은 다른 용도 가능)
+      g_object_set(audio_sink_, "device-clsid", device_id.substr(5).c_str(),
+                   "occupy-all-channels", FALSE, nullptr);
+    }
+  } else {
+    audio_sink_ = MakeElement("wasapi2sink", "asink");
+    if (audio_sink_ && !device_id.empty()) {
+      g_object_set(audio_sink_, "device", device_id.c_str(), nullptr);
+    }
   }
+  if (!audio_sink_) audio_sink_ = MakeElement("autoaudiosink", "asink");
   gst_bin_add(GST_BIN(pipeline_), audio_sink_);
   const bool ok = gst_element_link(audio_tail_, audio_sink_);
   gst_element_sync_state_with_parent(audio_sink_);

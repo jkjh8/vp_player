@@ -46,6 +46,10 @@ foreach ($name in $pluginNames) {
 }
 if ($missing) { Write-Warning "plugins not found (skipped): $($missing -join ', ')" }
 
+# 직접 빌드한 asio 플러그인 (공식 바이너리 미포함 — third_party/gstasio, CMake 타깃)
+$asioDll = Join-Path $repo "build\$Config\gstasio.dll"
+if (Test-Path $asioDll) { Copy-Item $asioDll $outPlugins } else { Write-Warning "gstasio.dll not built — ASIO 미포함" }
+
 # --- 2. exe 복사 ---------------------------------------------------------------
 Copy-Item $exe $out
 
