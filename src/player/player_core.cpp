@@ -946,13 +946,21 @@ void PlayerCore::SetBackgroundColor(uint32_t rgb) {
 
 namespace {
 
-// 디바이스 caps에서 고정 채널 수 추출 (범위/미지정이면 0)
+// 디바이스 caps에서 최대 채널 수 추출.
+// wasapi2는 고정 int, asio는 범위 [1, max]로 인코딩(gstasioobject.cpp) — 범위면 상한을 취한다.
 int DeviceCapsChannels(GstDevice* dev) {
   GstCaps* caps = gst_device_get_caps(dev);
   if (!caps) return 0;
   int channels = 0;
-  if (gst_caps_get_size(caps) > 0) {
-    gst_structure_get_int(gst_caps_get_structure(caps, 0), "channels", &channels);
+  for (guint i = 0; i < gst_caps_get_size(caps); i++) {
+    const GstStructure* s = gst_caps_get_structure(caps, i);
+    const GValue* v = gst_structure_get_value(s, "channels");
+    if (!v) continue;
+    if (G_VALUE_HOLDS_INT(v)) {
+      channels = std::max(channels, g_value_get_int(v));
+    } else if (GST_VALUE_HOLDS_INT_RANGE(v)) {
+      channels = std::max(channels, gst_value_get_int_range_max(v));
+    }
   }
   gst_caps_unref(caps);
   return channels;
