@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "media/probe.h"
 #include "net/tcp_server.h"
 #include "player/player_core.h"
 #include "video/video_window.h"
@@ -123,6 +124,31 @@ void HandleCommand(const json& msg) {
     SendFeedback("debug", "ack: set_track_index");
   } else if (cmd == "playlist_play") {
     core.PlayTrackIndex(msg.value("idx", 0));
+  } else if (cmd == "probe_media") {
+    // ffmpeg-static 대체 (Phase 2.5) — 워커 스레드에서 GstDiscoverer, req_id로 응답 상관
+    const int req_id = msg.value("req_id", -1);
+    const std::string p = msg.value("path", "");
+    vp::ProbeMediaAsync(p, [req_id](const json& meta) {
+      json data = meta;
+      data["req_id"] = req_id;
+      data["ok"] = !meta.contains("error");
+      SendFeedback("probe_result", data);
+    });
+  } else if (cmd == "make_thumbnail") {
+    const int req_id = msg.value("req_id", -1);
+    const std::string p = msg.value("path", "");
+    const std::string outp = msg.value("out", "");
+    const bool is_image = msg.value("is_image", false);
+    const double at_sec = msg.value("at_sec", 5.0);
+    const int width = msg.value("width", 320);
+    vp::MakeThumbnailAsync(p, outp, is_image, at_sec, width,
+                           [req_id, outp](bool ok, const std::string& err) {
+                             SendFeedback("thumbnail_result",
+                                          json{{"req_id", req_id},
+                                               {"ok", ok},
+                                               {"out", outp},
+                                               {"error", err}});
+                           });
   } else if (cmd == "show_logo") {
     core.SetLogoEnabled(msg.value("show", false));
   } else if (cmd == "logo_file") {

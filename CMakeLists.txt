@@ -62,6 +62,7 @@ add_executable(vplayer
   src/net/tcp_server.cpp
   src/player/player_core.cpp
   src/video/video_window.cpp
+  src/media/probe.cpp
   src/app.manifest
 )
 
