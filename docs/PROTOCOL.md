@@ -747,12 +747,13 @@ wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio =
   소스는 map 길이 채널수로 다운/업믹스된 뒤 배치된다 (예: `[4,5]` = 스테레오를 버스 4,5로).
   부재/`null`/빈 배열 = v1 동작 (스테레오 다운믹스 → 버스 0,1).
 - `volume: 0-100` — 덱 볼륨 (기본 100). **다음 로드부터 적용** (라이브 덱 변경 명령은 없음).
+- `muted: bool` — true면 실효 볼륨 0 (기본 false). 덱은 다음 로드부터 적용.
 
 **독립 오디오 트랙.** 덱과 무관한 오디오 전용 병행 스트림 (동시 최대 8개, 초과 시 `error`).
-- `audio_track_play {track_id:string, file, volume?, channel_map?, loop?:bool}` —
-  `volume`/`channel_map` 은 명령 레벨 우선, `file` 객체 폴백. 같은 `track_id` 재호출 = 교체.
-  `loop:true` = 플레이어 측 루프 (EOS 차단 + 플러시 시크, 갭 수 ms). 비오디오 스트림
-  (MP3 앨범아트 등)은 무시된다.
+- `audio_track_play {track_id:string, file, volume?, channel_map?, loop?:bool, muted?:bool}` —
+  `volume`/`channel_map`/`muted` 는 명령 레벨 우선, `file` 객체 폴백. `muted:true`면 실효
+  볼륨 0. 같은 `track_id` 재호출 = 교체. `loop:true` = 플레이어 측 루프 (EOS 차단 +
+  플러시 시크, 갭 수 ms). 비오디오 스트림(MP3 앨범아트 등)은 무시된다.
 - `audio_track_stop {track_id}` — 정지 + 해체. `state:"stopped"` 인 `audio_track_data` 1회 발신.
 - `audio_track_pause {track_id}` — 토글 (v1 덱 `pause` 와 동일 규약).
 - `audio_track_set_volume {track_id, volume:0-100}` — 라이브 적용.

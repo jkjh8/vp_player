@@ -703,6 +703,7 @@ PlayerCore::Deck* PlayerCore::BuildDeck(int deck_id, const json& file, int track
   if (const auto it = file.find("volume"); it != file.end() && it->is_number()) {
     deck->volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
   }
+  if (file.value("muted", false)) deck->volume_gain = 0.0;  // 임베디드 오디오 뮤트
 
   deck->bin = gst_bin_new(deck_id == 0 ? "deck0" : "deck1");
   deck->decode = MakeElement("uridecodebin3", nullptr);
@@ -1429,6 +1430,7 @@ void PlayerCore::AudioTrackPlay(const json& msg) {
   } else if (const auto fit = file.find("volume"); fit != file.end() && fit->is_number()) {
     track->volume_gain = std::clamp(fit->get<double>(), 0.0, 100.0) / 100.0;
   }
+  if (msg.value("muted", false) || file.value("muted", false)) track->volume_gain = 0.0;
   const json* map_src = nullptr;
   if (const auto it = msg.find("channel_map"); it != msg.end() && it->is_array() && !it->empty())
     map_src = &*it;
