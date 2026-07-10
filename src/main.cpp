@@ -64,14 +64,15 @@ void HandleCommand(const json& msg) {
     core.PlayFile(msg["file"], msg.value("track_idx", -1), image_time);
   } else if (cmd == "play_current_and_load_next") {
     const int track_idx = msg.value("track_idx", -1);
+    int current_slot = -1;
     if (msg.contains("current") && !msg["current"].is_null()) {
       // current_time (초) 이 file.time 을 덮어씀 — 프로토콜 §2.5
       const double t = msg.value("current_time", msg["current"].value("time", 0.0));
-      core.PlayFile(msg["current"], track_idx, t);
+      current_slot = core.PlayFile(msg["current"], track_idx, t);
     }
     if (msg.contains("next") && !msg["next"].is_null()) {
       const double t = msg.value("next_time", msg["next"].value("time", 0.0));
-      core.PreloadNext(msg["next"], track_idx >= 0 ? track_idx + 1 : -1, t);
+      core.PreloadNext(msg["next"], track_idx >= 0 ? track_idx + 1 : -1, t, current_slot);
     }
   } else if (cmd == "preload_next") {
     if (msg.contains("next") && !msg["next"].is_null()) {

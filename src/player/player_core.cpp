@@ -804,15 +804,25 @@ void PlayerCore::TeardownDeck(Deck* deck) {
 // 공개 명령
 // ---------------------------------------------------------------------------
 
-void PlayerCore::PlayFile(const json& file, int track_idx, double image_time_s) {
+int PlayerCore::PlayFile(const json& file, int track_idx, double image_time_s) {
   // 라이브 덱과 다른 슬롯에 빌드 → 프리롤 완료 시 자동 스왑
   const int slot = (live_deck_ == 0) ? 1 : 0;
   if (standby_deck_ >= 0 && decks_[standby_deck_]) TeardownDeck(decks_[standby_deck_].get());
   BuildDeck(slot, file, track_idx, /*play_when_ready=*/true, image_time_s);
+  return slot;
 }
 
-void PlayerCore::PreloadNext(const json& file, int track_idx, double image_time_s) {
-  const int slot = (live_deck_ == 0) ? 1 : 0;
+void PlayerCore::PreloadNext(const json& file, int track_idx, double image_time_s, int avoid_slot) {
+  // live_deck_는 PlayFile 호출 직후에도 아직 갱신 전(스왑은 프리롤 완료 후 비동기)이라,
+  // 같은 커맨드에서 PlayFile 다음에 호출되면 동일 슬롯을 골라 current 덱을 덮어쓸 수 있음
+  // (play_current_and_load_next 버그) — avoid_slot으로 충돌을 피한다.
+  int slot = (live_deck_ == 0) ? 1 : 0;
+  if (slot == avoid_slot) slot = 1 - slot;
+  if (slot == live_deck_) {
+    // 라이브 덱과 충돌 → 지금은 여유 슬롯이 없음 (스왑 이후 별도 preload_next로 재시도)
+    feedback_("debug", "preload_next skipped: no free slot");
+    return;
+  }
   BuildDeck(slot, file, track_idx, /*play_when_ready=*/false, image_time_s);
 }
 

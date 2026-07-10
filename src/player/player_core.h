@@ -37,8 +37,11 @@ class PlayerCore {
 
   // file: 호스트가 주는 file 객체 (path 필수, uuid 등은 피드백에 반사)
   // image_time_s: 이미지 표시 시간 (초, 0 = 무한) — is_image일 때만 의미
-  void PlayFile(const nlohmann::json& file, int track_idx, double image_time_s = 0.0);
-  void PreloadNext(const nlohmann::json& file, int track_idx, double image_time_s = 0.0);
+  // 반환값: 배정된 덱 슬롯 (0/1) — play_current_and_load_next에서 next가 같은 슬롯을
+  // 고르지 않도록 avoid_slot으로 넘겨줌
+  int PlayFile(const nlohmann::json& file, int track_idx, double image_time_s = 0.0);
+  void PreloadNext(const nlohmann::json& file, int track_idx, double image_time_s = 0.0,
+                    int avoid_slot = -1);
   bool Next();  // 프리롤된 대기 덱으로 스왑
 
   void Play();
