@@ -39,6 +39,15 @@ void SendFeedback(const std::string& type, const json& data) {
   g_app->server.SendLine(msg.dump());
 }
 
+// track_id는 문자열이 규약이나 숫자도 허용 (json.value는 타입 불일치 시 throw)
+std::string TrackIdOf(const json& msg) {
+  const auto it = msg.find("track_id");
+  if (it == msg.end()) return "";
+  if (it->is_string()) return it->get<std::string>();
+  if (it->is_number_integer()) return std::to_string(it->get<long long>());
+  return "";
+}
+
 // "#RRGGBB" / "RRGGBB" → 0xRRGGBB
 bool ParseHexColor(const std::string& text, uint32_t* out) {
   std::string hex = text;
@@ -113,6 +122,9 @@ void HandleCommand(const json& msg) {
     }
   } else if (cmd == "get_audio_devices") {
     SendFeedback("audiodevices", json{{"devices", core.ListAudioDevices()}});
+  } else if (cmd == "get_audio_device_caps") {
+    // v2 (§5): v1 audiodevices와 동일 데이터 — 열람이 이미 type/channels를 포함
+    SendFeedback("audio_device_caps", json{{"devices", core.ListAudioDevices()}});
   } else if (cmd == "set_audio_device") {
     core.SetAudioDevice(msg.value("device_id", ""));
   } else if (cmd == "playlist_mode") {
@@ -150,6 +162,17 @@ void HandleCommand(const json& msg) {
                                                {"out", outp},
                                                {"error", err}});
                            });
+  } else if (cmd == "audio_track_play") {
+    // v2 §5: 독립 오디오 트랙 — {track_id, file, volume?, channel_map?, loop?}
+    core.AudioTrackPlay(msg);
+  } else if (cmd == "audio_track_stop") {
+    core.AudioTrackStop(TrackIdOf(msg));
+  } else if (cmd == "audio_track_pause") {
+    core.AudioTrackPause(TrackIdOf(msg));
+  } else if (cmd == "audio_track_set_volume") {
+    core.AudioTrackSetVolume(TrackIdOf(msg), msg.value("volume", 100.0));
+  } else if (cmd == "audio_track_set_channel_map") {
+    core.AudioTrackSetChannelMap(TrackIdOf(msg), msg.value("map", json::array()));
   } else if (cmd == "show_logo") {
     core.SetLogoEnabled(msg.value("show", false));
   } else if (cmd == "logo_file") {
@@ -178,7 +201,13 @@ gboolean OnTick(gpointer) {
 }
 
 gboolean SendReady(gpointer) {
+  // 클라이언트 연결 전 발송은 유실됨 (SendLine은 미연결 시 무시) — 연결될 때까지
+  // 500ms 주기로 재시도. PROTOCOL.md §4가 경고한 ready 레이스의 실제 해소 지점.
+  if (!g_app->server.HasClient()) return G_SOURCE_CONTINUE;
   SendFeedback("info", "Player ready");
+  // v2 기능 협상 (§5): 호스트는 이 목록으로 신규 명령 송신을 게이트 — 구버전 조합에서도
+  // 안전하게 강하 (v1 호스트는 모르는 피드백 type을 경고 후 무시)
+  SendFeedback("capabilities", json{{"features", json::array({"channel_map", "audio_track"})}});
   return G_SOURCE_REMOVE;
 }
 

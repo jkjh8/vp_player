@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -20,7 +21,12 @@ namespace vp {
 //   [deck 0/1] uridecodebin3 ─ video: queue!d3d11upload!d3d11convert ─▶ comp.sink (zorder 1+id)
 //                            └ audio: queue!audioconvert!audioresample!volume ─▶ amix.sink
 //   d3d11compositor ─▶ d3d11videosink (자체 창 HWND, GstVideoOverlay)
-//   [silence] audiotestsrc(live) ─▶ audiomixer ─▶ audioconvert!audioresample ─▶ wasapi2sink
+//   [silence] audiotestsrc(live, mono) ─▶ audiomixer ─ capsfilter(버스 Nch)
+//              ─▶ audioconvert!audioresample ─▶ wasapi2sink/asiosink
+//
+// 오디오 버스(Phase 3): 채널수 N = 출력 디바이스 추종 (wasapi min(ch,8) positioned /
+// asio 드라이버 보고값 unpositioned). 각 브랜치 → 버스 채널 배치는 amix sink 패드의
+// converter-config mix-matrix (file.channel_map, 없으면 항등 = v1 동작).
 //
 // 덱 수명: Build(잠금+PAUSED, fakesink로 프리롤) → Swap(fakesink 제거, comp/amix
 // 요청 패드 연결, 패드 오프셋 = 현재 러닝타임, 잠금 해제→PLAYING) → Teardown.
@@ -66,10 +72,21 @@ class PlayerCore {
   void SetLogoSize(int width_px);   // 0 = 원본 크기
   void SetLogoEnabled(bool show);   // show_logo 명령
 
-  void EmitTick();  // 100ms 타이머에서 호출 — player_data 피드백
+  // 독립 오디오 트랙 (v2 §5) — 덱과 무관하게 병행 재생되는 오디오 전용 스트림.
+  // 플레이리스트 병행 오디오 레인 / 타임라인 오디오 클립의 실행 단위.
+  // msg = audio_track_play 명령 전체 ({track_id, file, volume?, channel_map?, loop?})
+  void AudioTrackPlay(const nlohmann::json& msg);
+  void AudioTrackStop(const std::string& track_id);
+  void AudioTrackPause(const std::string& track_id);  // 덱 pause와 동일한 토글
+  void AudioTrackSetVolume(const std::string& track_id, double volume);  // 0-100
+  void AudioTrackSetChannelMap(const std::string& track_id, const nlohmann::json& map);
+  void StopAllAudioTracks();
+
+  void EmitTick();  // 100ms 타이머에서 호출 — player_data / audio_track_data 피드백
 
  private:
   struct Deck;
+  struct AudioTrack;
 
   Deck* BuildDeck(int deck_id, const nlohmann::json& file, int track_idx, bool play_when_ready,
                   double image_time_s);
@@ -78,13 +95,22 @@ class PlayerCore {
   bool CheckPreroll(Deck* deck);  // 50ms 폴링 콜백 본체
   GstClockTime RunningTime() const;
 
+  bool CheckAudioTrackPreroll(AudioTrack* track);  // 50ms 폴링 콜백 본체
+  void ConnectAudioTrack(AudioTrack* track);       // 프리롤 완료 → amix 연결
+  void LoopAudioTrack(AudioTrack* track);          // SEGMENT_DONE/EOS → 0으로 재시크
+  void TeardownAudioTrack(const std::string& track_id);
+  void EmitAudioTrackData(AudioTrack* track, const char* state);
+
   bool InitLogoBranch();
   void PushLogoBuffer(int w, int h, const uint8_t* rgba);  // rgba 복사됨
   void ApplyLogoGeometry();
   void UpdateLogoVisibility(bool emit_feedback);
-  void DoAudioSinkSwap(const std::string& device_id);  // IDLE 프로브 콜백에서 실행
+  // IDLE 프로브 콜백에서 실행 — sink 교체 + 버스 채널수/positioned 전환
+  void DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned);
+  void ApplyDeckRouting(Deck* deck);  // channel_map → amix 패드 mix-matrix
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
+  static void OnAudioTrackPadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static GstBusSyncReply OnBusSync(GstBus* bus, GstMessage* msg, gpointer user_data);
   static gboolean OnBusMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
 
@@ -94,9 +120,13 @@ class PlayerCore {
   GstElement* pipeline_ = nullptr;
   GstElement* comp_ = nullptr;       // d3d11compositor (폴백: compositor)
   GstElement* amix_ = nullptr;       // audiomixer
+  GstElement* bus_caps_ = nullptr;   // amix 직후 출력 capsfilter (버스 채널수 정책 지점)
   GstElement* audio_tail_ = nullptr; // 출력단 audioresample (sink 교체 시 재연결 지점)
-  GstElement* audio_sink_ = nullptr; // wasapi2sink (폴백: autoaudiosink)
+  GstElement* audio_sink_ = nullptr; // wasapi2sink/asiosink (폴백: autoaudiosink)
   GstElement* bg_src_ = nullptr;     // videotestsrc solid-color
+  GstPad* silence_pad_ = nullptr;    // 무음 앵커의 amix 요청 패드 (matrix 갱신 지점)
+  int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)
+  bool bus_positioned_ = true;       // true = fallback mask, false = unpositioned(asio)
   bool use_d3d11_ = true;
 
   nlohmann::json tracks_ = nlohmann::json::array();  // set_tracks 사본 (레거시/폴백용)
@@ -107,6 +137,8 @@ class PlayerCore {
   int live_deck_ = -1;     // 현재 화면/소리를 점유한 덱 id
   int standby_deck_ = -1;  // 프리롤 중/완료된 대기 덱 id
   bool paused_ = false;
+
+  std::map<std::string, std::unique_ptr<AudioTrack>> audio_tracks_;  // track_id → 트랙
 
   // 로고 오버레이 상태
   GstElement* logo_src_ = nullptr;  // appsrc (RGBA) — 버퍼 1장 push, 컴포지터가 유지

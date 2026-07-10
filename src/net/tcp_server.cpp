@@ -71,6 +71,11 @@ void NdjsonServer::Stop() {
   WSACleanup();
 }
 
+bool NdjsonServer::HasClient() {
+  std::lock_guard lock(send_mutex_);
+  return client_sock_ != INVALID_SOCKET;
+}
+
 void NdjsonServer::SendLine(const std::string& json_line) {
   std::lock_guard lock(send_mutex_);
   if (client_sock_ == INVALID_SOCKET) return;

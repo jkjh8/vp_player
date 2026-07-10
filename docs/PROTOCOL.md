@@ -729,6 +729,49 @@ function handleEndReached(data) {
 | 피드백 | `timeline_position` | P→H | `{timeline_id, time_ms}` | 타임라인 위치 틱 |
 | 명령 | `get_audio_device_caps` | H→P | 응답 피드백 `audio_device_caps {"devices":[{deviceId, name, type:"wasapi"\|"asio", channels:int}]}` — WASAPI는 8ch 기준, ASIO는 드라이버가 보고하는 채널 수 | 멀티채널 출력 능력 조회 (v1 `get_audio_devices`/`audiodevices` 는 그대로 유지) |
 
+### 5.1 v2 구현 명세 — 멀티채널 라우팅 + 독립 오디오 트랙 (2026-07-10 구현 완료)
+
+위 표에서 `audio_track_*`, `get_audio_device_caps`, `capabilities` 는 구현 완료. 타임라인
+(`set_timeline`/`timeline_*`) 은 계속 예약 상태. 확정 시맨틱:
+
+**오디오 버스 정책.** 믹서 출력 채널수 N 은 `set_audio_device` 시 디바이스를 따른다 —
+wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio = 드라이버 보고
+채널수 + unpositioned(channel-mask=0). 기본(디바이스 미지정) = 2ch stereo. 디바이스
+전환은 재생 중에도 안전 (검증: `test/spike_mixcaps.cpp` 2↔128ch, `test/smoke7.js`).
+적용 완료 시 `info` 피드백 `"audio device applied: <id> (Nch bus)"`.
+
+**`channel_map` (v1 명령 확장 필드).** 모든 file/track 객체(`playid`, `set_media`,
+`play_current_and_load_next` 의 current/next, `preload_next.next`, `set_tracks[i]`)에
+옵션 필드로 실린다:
+- `channel_map: [int,...]` — 인덱스 = 소스 채널, 값 = 출력(버스) 채널 인덱스, `-1` = 뮤트.
+  소스는 map 길이 채널수로 다운/업믹스된 뒤 배치된다 (예: `[4,5]` = 스테레오를 버스 4,5로).
+  부재/`null`/빈 배열 = v1 동작 (스테레오 다운믹스 → 버스 0,1).
+- `volume: 0-100` — 덱 볼륨 (기본 100). **다음 로드부터 적용** (라이브 덱 변경 명령은 없음).
+
+**독립 오디오 트랙.** 덱과 무관한 오디오 전용 병행 스트림 (동시 최대 8개, 초과 시 `error`).
+- `audio_track_play {track_id:string, file, volume?, channel_map?, loop?:bool}` —
+  `volume`/`channel_map` 은 명령 레벨 우선, `file` 객체 폴백. 같은 `track_id` 재호출 = 교체.
+  `loop:true` = 플레이어 측 루프 (EOS 차단 + 플러시 시크, 갭 수 ms). 비오디오 스트림
+  (MP3 앨범아트 등)은 무시된다.
+- `audio_track_stop {track_id}` — 정지 + 해체. `state:"stopped"` 인 `audio_track_data` 1회 발신.
+- `audio_track_pause {track_id}` — 토글 (v1 덱 `pause` 와 동일 규약).
+- `audio_track_set_volume {track_id, volume:0-100}` — 라이브 적용.
+- `audio_track_set_channel_map {track_id, map:[int,...]}` — 라이브 적용. 단 브랜치 채널
+  폭은 `audio_track_play` 시점의 map 길이로 고정 — map 이 짧으면 나머지 소스채널 뮤트,
+  길면 초과분 무시. 폭 변경은 `audio_track_play` 재호출로.
+- 피드백 `audio_track_data {track_id, time, duration, position, is_playing, state}` —
+  100ms 틱 (재생/일시정지 중), 단위 v1 과 동일 (ms / 0–1). `state`: `"playing"` |
+  `"paused"` | `"stopped"`(종료 시 1회). 자연 종료(비루프)도 stopped 1회 후 틱 중단.
+- 전역 `stop`/`stop_all` 은 **오디오 트랙에 영향 없음** — 생명주기는 전적으로 호스트가
+  `audio_track_stop` 으로 관리한다 (repeat 모드별 정책은 호스트 소관).
+
+**기능 협상.** ready 직후 피드백 `capabilities {"features":["channel_map","audio_track"]}` 발신.
+호스트는 이 목록에 있는 기능만 송신한다 (구버전 플레이어 = 목록 부재 = v1 강하).
+ready/capabilities 는 **첫 TCP 클라이언트 연결 후** 발신된다 (§4 의 500ms 레이스 해소 —
+연결 전이면 500ms 주기로 재시도).
+
+검증: `test/smoke7.js` (라우팅/디바이스 전환), `test/smoke8.js` (병행/루프/수명주기).
+
 ---
 
 ## 부록 A. 대표 시나리오 메시지 흐름

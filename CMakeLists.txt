@@ -87,6 +87,12 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   # target_compile_options(vplayer PRIVATE /fsanitize=address)
 endif()
 
+# --- A0 스파이크: 믹서 N채널 라이브 전환 검증 (배포 미포함, 개발 전용) ----------
+add_executable(spike_mixcaps EXCLUDE_FROM_ALL test/spike_mixcaps.cpp)
+target_link_libraries(spike_mixcaps PRIVATE PkgConfig::GST)
+target_compile_options(spike_mixcaps PRIVATE /utf-8 /W4 /EHsc)
+target_compile_definitions(spike_mixcaps PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
 # --- gstasio 플러그인 (third_party/gstasio 참조 — vendored, LGPL) ---------------
 # 공식 바이너리 미포함 플러그인을 함께 빌드해 번들. ASIO 디바이스 열람/출력용 (Phase 3 16ch).
 add_library(gstasio MODULE

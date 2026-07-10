@@ -32,6 +32,9 @@ class NdjsonServer {
   // 개행을 붙여 현재 클라이언트로 전송 (스레드 안전). 클라이언트 없으면 무시.
   void SendLine(const std::string& json_line);
 
+  // 클라이언트 연결 여부 (스레드 안전) — ready 발송 타이밍 판단용
+  bool HasClient();
+
  private:
   void AcceptLoop();
 
