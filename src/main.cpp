@@ -127,6 +127,9 @@ void HandleCommand(const json& msg) {
     SendFeedback("audio_device_caps", json{{"devices", core.ListAudioDevices()}});
   } else if (cmd == "set_audio_device") {
     core.SetAudioDevice(msg.value("device_id", ""));
+  } else if (cmd == "set_deck_audio") {
+    // 활성 덱(임베디드 오디오) 라이브 라우팅/볼륨/뮤트
+    core.SetDeckAudio(msg);
   } else if (cmd == "playlist_mode") {
     core.SetPlaylistMode(msg.value("value", false));
     SendFeedback("debug", "ack: playlist_mode");
@@ -207,7 +210,8 @@ gboolean SendReady(gpointer) {
   SendFeedback("info", "Player ready");
   // v2 기능 협상 (§5): 호스트는 이 목록으로 신규 명령 송신을 게이트 — 구버전 조합에서도
   // 안전하게 강하 (v1 호스트는 모르는 피드백 type을 경고 후 무시)
-  SendFeedback("capabilities", json{{"features", json::array({"channel_map", "audio_track"})}});
+  SendFeedback("capabilities",
+               json{{"features", json::array({"channel_map", "audio_track", "live_routing"})}});
   return G_SOURCE_REMOVE;
 }
 

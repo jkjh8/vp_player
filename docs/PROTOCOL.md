@@ -746,8 +746,13 @@ wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio =
 - `channel_map: [int,...]` — 인덱스 = 소스 채널, 값 = 출력(버스) 채널 인덱스, `-1` = 뮤트.
   소스는 map 길이 채널수로 다운/업믹스된 뒤 배치된다 (예: `[4,5]` = 스테레오를 버스 4,5로).
   부재/`null`/빈 배열 = v1 동작 (스테레오 다운믹스 → 버스 0,1).
-- `volume: 0-100` — 덱 볼륨 (기본 100). **다음 로드부터 적용** (라이브 덱 변경 명령은 없음).
-- `muted: bool` — true면 실효 볼륨 0 (기본 false). 덱은 다음 로드부터 적용.
+- `volume: 0-100` — 덱 볼륨 (기본 100). 로드 시 적용 + `set_deck_audio`로 라이브 변경 가능.
+- `muted: bool` — true면 실효 볼륨 0 (기본 false).
+
+**`set_deck_audio {channel_map?, volume?, muted?}` (H→P).** 활성 덱(임베디드 오디오)의
+라우팅/볼륨/뮤트를 **재생 중 라이브** 변경. `channel_map`은 브랜치 채널 폭(로드 시 협상값)
+내에서 amix 패드 mix-matrix만 갱신 — 폭 자체를 바꾸려면 재로드(set_tracks/재생). 구버전
+플레이어는 무시하므로 `capabilities.features` 에 `live_routing` 이 있을 때만 전송할 것.
 
 **독립 오디오 트랙.** 덱과 무관한 오디오 전용 병행 스트림 (동시 최대 8개, 초과 시 `error`).
 - `audio_track_play {track_id:string, file, volume?, channel_map?, loop?:bool, muted?:bool}` —

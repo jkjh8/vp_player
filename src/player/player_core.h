@@ -59,6 +59,11 @@ class PlayerCore {
   nlohmann::json ListAudioDevices();                  // wasapi2 프로바이더만
   void SetAudioDevice(const std::string& device_id);  // 라이브 전환 (sink 교체)
 
+  // 활성 덱(임베디드 오디오)의 라우팅/볼륨/뮤트를 재생 중 라이브 변경.
+  // msg = {channel_map?, volume?, muted?}. 브랜치 채널 폭은 유지(로드 시 고정) —
+  // channel_map은 현재 폭 내에서 amix 패드 matrix만 갱신한다.
+  void SetDeckAudio(const nlohmann::json& msg);
+
   // 레거시 호환 경로 (프로토콜 §2: 현재 호스트 미사용이나 호환성 유지) + prev/next 폴백
   void SetPlaylistMode(bool on) { playlist_mode_ = on; }
   void SetTracks(const nlohmann::json& tracks);

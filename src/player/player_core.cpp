@@ -1257,6 +1257,41 @@ void PlayerCore::ApplyDeckRouting(Deck* deck) {
                deck->has_map ? deck->channel_map : std::vector<int>{});
 }
 
+void PlayerCore::SetDeckAudio(const json& msg) {
+  if (live_deck_ < 0 || !decks_[live_deck_]) {
+    feedback_("debug", "set_deck_audio: no live deck");
+    return;
+  }
+  Deck* deck = decks_[live_deck_].get();
+
+  // 라우팅: 브랜치 폭(로드 시 협상값)은 유지, map만 갱신해 matrix 라이브 재설정
+  if (const auto it = msg.find("channel_map"); it != msg.end()) {
+    deck->channel_map.clear();
+    if (it->is_array()) {
+      for (const auto& v : *it)
+        deck->channel_map.push_back(v.is_number_integer() ? v.get<int>() : -1);
+    }
+    deck->has_map = !deck->channel_map.empty();
+    ApplyDeckRouting(deck);  // amix 패드가 있으면 즉시 반영
+  }
+
+  // 볼륨/뮤트: volume 요소(deck->audio_tail) 라이브 변경
+  bool touch_vol = false;
+  double vol = deck->volume_gain;
+  if (const auto it = msg.find("volume"); it != msg.end() && it->is_number()) {
+    vol = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
+    touch_vol = true;
+  }
+  if (const auto it = msg.find("muted"); it != msg.end()) {
+    vol = it->get<bool>() ? 0.0 : vol;  // muted=true면 0, false면 volume값 유지
+    touch_vol = true;
+  }
+  if (touch_vol) {
+    deck->volume_gain = vol;
+    if (deck->audio_tail) g_object_set(deck->audio_tail, "volume", vol, nullptr);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 레거시 트랙 경로 (set_tracks/previous/playlist_play) + next 폴백
 // ---------------------------------------------------------------------------
