@@ -749,10 +749,27 @@ wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio =
 - `volume: 0-100` — 덱 볼륨 (기본 100). 로드 시 적용 + `set_deck_audio`로 라이브 변경 가능.
 - `muted: bool` — true면 실효 볼륨 0 (기본 false).
 
-**`set_deck_audio {channel_map?, volume?, muted?}` (H→P).** 활성 덱(임베디드 오디오)의
-라우팅/볼륨/뮤트를 **재생 중 라이브** 변경. `channel_map`은 브랜치 채널 폭(로드 시 협상값)
-내에서 amix 패드 mix-matrix만 갱신 — 폭 자체를 바꾸려면 재로드(set_tracks/재생). 구버전
-플레이어는 무시하므로 `capabilities.features` 에 `live_routing` 이 있을 때만 전송할 것.
+**`embedded_streams` (채널별 라우팅/볼륨/뮤트, `channel_map`의 상위 확장).** 모든 file/track
+객체에 옵션으로 실린다. 있으면 `channel_map`/`volume`/`muted`보다 우선:
+```
+"embedded_streams": [
+  { "index":0, "volume":100, "muted":false,          // 스트림(마스터) 볼륨/뮤트
+    "channels":[ {"out":0,"volume":100,"muted":false},// 소스 채널별 {출력, gain, 뮤트}
+                 {"out":1,"volume":50,"muted":false} ] }
+]
+```
+- `channels[c]` = 소스 채널 c → `{out(-1=뮤트/미라우팅), volume 0-100(=mix-matrix 계수), muted}`.
+  실효 = 마스터 볼륨(브랜치 volume 요소) × 채널 gain(matrix 계수).
+- 스트림 `volume`/`muted` = 마스터(스트림 전체). 채널 폭 = `channels.length`.
+- **현재 플레이어는 `embedded_streams[0]`(첫 스트림)만 처리** — 다중 스트림(다국어)은 Phase D2 예정.
+- 부재 시 레거시 `channel_map`/`volume`/`muted` 폴백(스트림0 동작).
+
+**`set_deck_audio {streams?:[{index, volume?, muted?, channels?:[{out,volume?,muted?}]}], channel_map?, volume?, muted?}` (H→P).**
+활성 덱(임베디드 오디오)의 라우팅/볼륨/뮤트를 **재생 중 라이브** 변경. `streams[0]`의
+`channels`는 채널별 mix-matrix 계수를, `volume`/`muted`는 마스터(volume 요소)를 갱신(부분
+갱신 — 준 필드만). 레거시 `{channel_map,volume,muted}`(streams 없이)는 스트림0 전체 대상.
+브랜치 채널 폭(로드 시 협상값)은 유지 — 폭 변경은 재로드. 구버전 플레이어는 무시하므로
+`capabilities.features` 에 `live_routing` 이 있을 때만 전송할 것.
 
 **독립 오디오 트랙.** 덱과 무관한 오디오 전용 병행 스트림 (동시 최대 8개, 초과 시 `error`).
 - `audio_track_play {track_id:string, file, volume?, channel_map?, loop?:bool, muted?:bool}` —
@@ -762,21 +779,23 @@ wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio =
 - `audio_track_stop {track_id}` — 정지 + 해체. `state:"stopped"` 인 `audio_track_data` 1회 발신.
 - `audio_track_pause {track_id}` — 토글 (v1 덱 `pause` 와 동일 규약).
 - `audio_track_set_volume {track_id, volume:0-100}` — 라이브 적용.
-- `audio_track_set_channel_map {track_id, map:[int,...]}` — 라이브 적용. 단 브랜치 채널
-  폭은 `audio_track_play` 시점의 map 길이로 고정 — map 이 짧으면 나머지 소스채널 뮤트,
-  길면 초과분 무시. 폭 변경은 `audio_track_play` 재호출로.
+- `audio_track_play` 는 `channels:[{out,volume,muted}]`(채널별) 도 받는다(없으면 `channel_map` 폴백).
+- `audio_track_set_channel_map {track_id, map}` — `map` 은 채널별 `[{out,volume,muted}]`(신규)
+  또는 레거시 `[int,...]`. 라이브 적용. 브랜치 채널 폭은 `audio_track_play` 시점 고정.
 - 피드백 `audio_track_data {track_id, time, duration, position, is_playing, state}` —
   100ms 틱 (재생/일시정지 중), 단위 v1 과 동일 (ms / 0–1). `state`: `"playing"` |
   `"paused"` | `"stopped"`(종료 시 1회). 자연 종료(비루프)도 stopped 1회 후 틱 중단.
 - 전역 `stop`/`stop_all` 은 **오디오 트랙에 영향 없음** — 생명주기는 전적으로 호스트가
   `audio_track_stop` 으로 관리한다 (repeat 모드별 정책은 호스트 소관).
 
-**기능 협상.** ready 직후 피드백 `capabilities {"features":["channel_map","audio_track"]}` 발신.
+**기능 협상.** ready 직후 피드백
+`capabilities {"features":["channel_map","audio_track","live_routing","embedded_streams"]}` 발신.
 호스트는 이 목록에 있는 기능만 송신한다 (구버전 플레이어 = 목록 부재 = v1 강하).
 ready/capabilities 는 **첫 TCP 클라이언트 연결 후** 발신된다 (§4 의 500ms 레이스 해소 —
 연결 전이면 500ms 주기로 재시도).
 
-검증: `test/smoke7.js` (라우팅/디바이스 전환), `test/smoke8.js` (병행/루프/수명주기).
+검증: `test/smoke7.js` (라우팅/디바이스 전환), `test/smoke8.js` (병행/루프/수명주기),
+`test/smoke9.js` (채널별 gain/mute/라우팅 + 마스터 볼륨/뮤트 라이브 + 레거시 회귀).
 
 ---
 

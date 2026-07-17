@@ -53,20 +53,33 @@ GstCaps* MakeBranchCaps(int channels) {
                              G_TYPE_STRING, "interleaved", nullptr);
 }
 
-// map[src] = 버스 채널 인덱스 (-1 = 뮤트), 빈 map = 항등(src i → 버스 i).
+// 채널별 라우팅: 소스 채널 s → 버스 채널 out, gain(0~1), muted.
+// out<0 또는 muted면 그 소스 채널은 어디에도 안 나감(계수 0).
+struct ChannelRoute {
+  int out = -1;
+  float gain = 1.0f;
+  bool muted = false;
+};
+
 // mix-matrix 규약: 행 = 출력(버스) 채널, 열 = 입력(브랜치) 채널.
-GstStructure* MakeMatrixConfig(int src_ch, int out_ch, const std::vector<int>& map) {
+// matrix[o][s] = (routes[s].muted || routes[s].out != o) ? 0 : routes[s].gain
+GstStructure* MakeMatrixConfig(int src_ch, int out_ch, const std::vector<ChannelRoute>& routes) {
   GValue matrix = G_VALUE_INIT;
   g_value_init(&matrix, GST_TYPE_ARRAY);
   for (int o = 0; o < out_ch; ++o) {
     GValue row = G_VALUE_INIT;
     g_value_init(&row, GST_TYPE_ARRAY);
     for (int s = 0; s < src_ch; ++s) {
+      float coeff = 0.0f;
+      if (s < static_cast<int>(routes.size())) {
+        const ChannelRoute& r = routes[s];
+        if (!r.muted && r.out == o) coeff = r.gain;
+      } else if (routes.empty() && s == o) {
+        coeff = 1.0f;  // 빈 routes = 항등
+      }
       GValue v = G_VALUE_INIT;
       g_value_init(&v, G_TYPE_FLOAT);
-      const bool hit = map.empty() ? (s == o)
-                                   : (s < static_cast<int>(map.size()) && map[s] == o);
-      g_value_set_float(&v, hit ? 1.0f : 0.0f);
+      g_value_set_float(&v, coeff);
       gst_value_array_append_value(&row, &v);
       g_value_unset(&v);
     }
@@ -79,11 +92,70 @@ GstStructure* MakeMatrixConfig(int src_ch, int out_ch, const std::vector<int>& m
   return st;
 }
 
+// 레거시 map[src]=out(-1 뮤트) 버전 — gain 1.0 위임 (오디오 트랙 등에서 사용)
+GstStructure* MakeMatrixConfig(int src_ch, int out_ch, const std::vector<int>& map) {
+  std::vector<ChannelRoute> routes;
+  routes.reserve(map.size());
+  for (int out : map) routes.push_back({out, 1.0f, out < 0});
+  return MakeMatrixConfig(src_ch, out_ch, routes);
+}
+
 // unpositioned 버스는 명시적 matrix가 필수(암시 변환 불가)라 모든 amix 패드에 항상 설정
 void SetPadMatrix(GstPad* pad, int src_ch, int out_ch, const std::vector<int>& map) {
   GstStructure* st = MakeMatrixConfig(src_ch, out_ch, map);
   g_object_set(pad, "converter-config", st, nullptr);
   gst_structure_free(st);
+}
+void SetPadMatrix(GstPad* pad, int src_ch, int out_ch, const std::vector<ChannelRoute>& routes) {
+  GstStructure* st = MakeMatrixConfig(src_ch, out_ch, routes);
+  g_object_set(pad, "converter-config", st, nullptr);
+  gst_structure_free(st);
+}
+
+// file/stream 객체에서 채널별 routes + 마스터 볼륨/뮤트 추출.
+// embedded_streams[0](채널별 {out,volume,muted} + 스트림 마스터 volume/muted) 우선,
+// 없으면 레거시 channel_map/volume/muted(스트림 마스터). 둘 다 없으면 항등(빈 routes).
+struct StreamAudio {
+  std::vector<ChannelRoute> routes;
+  double volume_gain = 1.0;   // 마스터
+  bool master_muted = false;  // 마스터
+};
+
+ChannelRoute ParseChannel(const nlohmann::json& c) {
+  ChannelRoute r;
+  r.out = c.value("out", -1);
+  r.gain = static_cast<float>(std::clamp(c.value("volume", 100.0), 0.0, 100.0) / 100.0);
+  r.muted = c.value("muted", false);
+  return r;
+}
+
+StreamAudio ParseFileAudio(const nlohmann::json& file) {
+  StreamAudio a;
+  const nlohmann::json* stream = nullptr;
+  if (const auto it = file.find("embedded_streams");
+      it != file.end() && it->is_array() && !it->empty()) {
+    stream = &(*it)[0];
+  }
+  if (stream) {
+    if (const auto ch = stream->find("channels"); ch != stream->end() && ch->is_array()) {
+      for (const auto& c : *ch) a.routes.push_back(ParseChannel(c));
+    }
+    a.volume_gain = std::clamp(stream->value("volume", 100.0), 0.0, 100.0) / 100.0;
+    a.master_muted = stream->value("muted", false);
+  } else {
+    if (const auto it = file.find("channel_map");
+        it != file.end() && it->is_array() && !it->empty()) {
+      for (const auto& v : *it) {
+        const int out = v.is_number_integer() ? v.get<int>() : -1;
+        a.routes.push_back({out, 1.0f, out < 0});
+      }
+    }
+    if (const auto it = file.find("volume"); it != file.end() && it->is_number()) {
+      a.volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
+    }
+    a.master_muted = file.value("muted", false);
+  }
+  return a;
 }
 
 GstElement* MakeElement(const char* factory, const char* name) {
@@ -156,12 +228,13 @@ struct PlayerCore::Deck {
   GstClockTime preroll_started = 0;
   GstClockTime paused_running = GST_CLOCK_TIME_NONE;  // Pause 시점 러닝타임 (재개 보정용)
 
-  // 오디오 라우팅 (Phase 3): file.channel_map / file.volume — BuildDeck에서 파싱,
-  // 브랜치 capsfilter(OnDecodePadAdded)와 amix 패드 matrix(SwapTo)에 적용
-  std::vector<int> channel_map;  // map[src] = 버스 채널 (-1=뮤트), 비어있으면 항등
-  bool has_map = false;
-  int branch_channels = 2;       // 브랜치 채널 폭 (has_map ? map.size() : 2)
-  double volume_gain = 1.0;      // file.volume 0-100 → 0.0-1.0
+  // 오디오 라우팅 (Phase 3 / A1 채널별): file.embedded_streams[0] 또는 레거시 channel_map.
+  // channel_routes = 소스 채널별 {out, gain, muted} (mix-matrix 계수). 마스터(스트림 전체)
+  // 볼륨/뮤트는 volume_gain / master_muted 로 volume 요소에 적용된다(채널 gain과 곱).
+  std::vector<ChannelRoute> channel_routes;
+  int branch_channels = 2;       // 브랜치 채널 폭 (channel_routes.size(), 기본 2)
+  double volume_gain = 1.0;      // 마스터 볼륨 0-100 → 0.0-1.0
+  bool master_muted = false;     // 마스터 뮤트 (volume 요소 0)
 
   // 이미지 스틸: imagefreeze는 EOS를 내지 않으므로 표시 시간은 타이머가 담당
   bool is_image = false;
@@ -205,9 +278,10 @@ struct PlayerCore::AudioTrack {
 
   bool loop = false;
   bool stopped_sent = false;       // state:"stopped" 피드백 1회 보장
-  std::vector<int> channel_map;    // 빈 map = 항등
+  std::vector<ChannelRoute> channel_routes;  // 채널별 {out,gain,muted}, 빈 것 = 항등
   int branch_channels = 2;
-  double volume_gain = 1.0;
+  double volume_gain = 1.0;         // 마스터 볼륨
+  bool master_muted = false;        // 마스터 뮤트
 };
 
 // ---------------------------------------------------------------------------
@@ -640,7 +714,7 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
       gst_caps_unref(caps);
     }
     GstElement* vol = MakeElement("volume", nullptr);
-    g_object_set(vol, "volume", deck->volume_gain, nullptr);
+    g_object_set(vol, "volume", deck->master_muted ? 0.0 : deck->volume_gain, nullptr);
 
     gst_bin_add_many(GST_BIN(deck->bin), q, conv, res, capsf, vol, nullptr);
     bool ok = gst_element_link_many(q, conv, res, capsf, vol, nullptr);
@@ -693,17 +767,14 @@ PlayerCore::Deck* PlayerCore::BuildDeck(int deck_id, const json& file, int track
                    file.value("mimetype", std::string()).rfind("image/", 0) == 0;
   deck->image_time_ms = static_cast<gint64>(image_time_s * 1000.0);
 
-  // 오디오 라우팅/볼륨 (v2 옵션 필드 — 없으면 v1 동작: 스테레오 다운믹스 → 버스 0,1)
-  if (const auto it = file.find("channel_map");
-      it != file.end() && it->is_array() && !it->empty()) {
-    for (const auto& v : *it) deck->channel_map.push_back(v.is_number_integer() ? v.get<int>() : -1);
-    deck->has_map = true;
-    deck->branch_channels = static_cast<int>(deck->channel_map.size());
+  // 오디오 라우팅/볼륨 (v2 채널별: embedded_streams[0], 또는 레거시 channel_map/volume/muted)
+  {
+    StreamAudio sa = ParseFileAudio(file);
+    deck->channel_routes = sa.routes;
+    deck->volume_gain = sa.volume_gain;
+    deck->master_muted = sa.master_muted;
+    deck->branch_channels = sa.routes.empty() ? 2 : static_cast<int>(sa.routes.size());
   }
-  if (const auto it = file.find("volume"); it != file.end() && it->is_number()) {
-    deck->volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
-  }
-  if (file.value("muted", false)) deck->volume_gain = 0.0;  // 임베디드 오디오 뮤트
 
   deck->bin = gst_bin_new(deck_id == 0 ? "deck0" : "deck1");
   deck->decode = MakeElement("uridecodebin3", nullptr);
@@ -1215,7 +1286,7 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, boo
     }
     for (auto& [id, t] : audio_tracks_) {
       if (t && t->amix_pad)
-        SetPadMatrix(t->amix_pad, t->branch_channels, output_channels_, t->channel_map);
+        SetPadMatrix(t->amix_pad, t->branch_channels, output_channels_, t->channel_routes);
     }
   }
 
@@ -1249,12 +1320,11 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, boo
   });
 }
 
-// 덱의 channel_map(없으면 항등)을 amix 패드 mix-matrix로 적용.
+// 덱의 채널별 routes를 amix 패드 mix-matrix로 적용. 마스터 볼륨/뮤트는 volume 요소.
 // 버스 채널수 변경(DoAudioSinkSwap)과 스왑(SwapTo) 양쪽에서 호출된다.
 void PlayerCore::ApplyDeckRouting(Deck* deck) {
   if (!deck->amix_pad) return;
-  SetPadMatrix(deck->amix_pad, deck->branch_channels, output_channels_,
-               deck->has_map ? deck->channel_map : std::vector<int>{});
+  SetPadMatrix(deck->amix_pad, deck->branch_channels, output_channels_, deck->channel_routes);
 }
 
 void PlayerCore::SetDeckAudio(const json& msg) {
@@ -1264,31 +1334,50 @@ void PlayerCore::SetDeckAudio(const json& msg) {
   }
   Deck* deck = decks_[live_deck_].get();
 
-  // 라우팅: 브랜치 폭(로드 시 협상값)은 유지, map만 갱신해 matrix 라이브 재설정
-  if (const auto it = msg.find("channel_map"); it != msg.end()) {
-    deck->channel_map.clear();
-    if (it->is_array()) {
-      for (const auto& v : *it)
-        deck->channel_map.push_back(v.is_number_integer() ? v.get<int>() : -1);
-    }
-    deck->has_map = !deck->channel_map.empty();
-    ApplyDeckRouting(deck);  // amix 패드가 있으면 즉시 반영
+  // 채널별 라우팅/볼륨/뮤트: streams[0](채널별) 또는 레거시 channel_map/volume/muted.
+  // 브랜치 폭(로드 시 협상값)은 유지 — 폭 변경은 재로드. matrix/volume만 라이브 갱신.
+  const json* stream = nullptr;
+  if (const auto it = msg.find("streams"); it != msg.end() && it->is_array() && !it->empty()) {
+    stream = &(*it)[0];
   }
-
-  // 볼륨/뮤트: volume 요소(deck->audio_tail) 라이브 변경
+  if (stream) {
+    if (const auto ch = stream->find("channels"); ch != stream->end() && ch->is_array()) {
+      deck->channel_routes.clear();
+      for (const auto& c : *ch) deck->channel_routes.push_back(ParseChannel(c));
+      ApplyDeckRouting(deck);
+    }
+    if (stream->contains("volume") || stream->contains("muted")) {
+      if (const auto v = stream->find("volume"); v != stream->end() && v->is_number())
+        deck->volume_gain = std::clamp(v->get<double>(), 0.0, 100.0) / 100.0;
+      if (stream->contains("muted")) deck->master_muted = stream->value("muted", false);
+      if (deck->audio_tail)
+        g_object_set(deck->audio_tail, "volume", deck->master_muted ? 0.0 : deck->volume_gain,
+                     nullptr);
+    }
+    return;
+  }
+  // 레거시 경로
+  if (const auto it = msg.find("channel_map"); it != msg.end()) {
+    deck->channel_routes.clear();
+    if (it->is_array()) {
+      for (const auto& v : *it) {
+        const int out = v.is_number_integer() ? v.get<int>() : -1;
+        deck->channel_routes.push_back({out, 1.0f, out < 0});
+      }
+    }
+    ApplyDeckRouting(deck);
+  }
   bool touch_vol = false;
-  double vol = deck->volume_gain;
   if (const auto it = msg.find("volume"); it != msg.end() && it->is_number()) {
-    vol = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
+    deck->volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
     touch_vol = true;
   }
   if (const auto it = msg.find("muted"); it != msg.end()) {
-    vol = it->get<bool>() ? 0.0 : vol;  // muted=true면 0, false면 volume값 유지
+    deck->master_muted = it->get<bool>();
     touch_vol = true;
   }
-  if (touch_vol) {
-    deck->volume_gain = vol;
-    if (deck->audio_tail) g_object_set(deck->audio_tail, "volume", vol, nullptr);
+  if (touch_vol && deck->audio_tail) {
+    g_object_set(deck->audio_tail, "volume", deck->master_muted ? 0.0 : deck->volume_gain, nullptr);
   }
 }
 
@@ -1364,7 +1453,7 @@ void PlayerCore::OnAudioTrackPadAdded(GstElement*, GstPad* pad, gpointer user_da
     gst_caps_unref(bcaps);
   }
   GstElement* vol = MakeElement("volume", nullptr);
-  g_object_set(vol, "volume", track->volume_gain, nullptr);
+  g_object_set(vol, "volume", track->master_muted ? 0.0 : track->volume_gain, nullptr);
 
   gst_bin_add_many(GST_BIN(track->bin), q, conv, res, capsf, vol, nullptr);
   bool ok = gst_element_link_many(q, conv, res, capsf, vol, nullptr);
@@ -1459,24 +1548,38 @@ void PlayerCore::AudioTrackPlay(const json& msg) {
   track->id = id;
   track->file = file;
   track->loop = msg.value("loop", false);
-  // volume/channel_map: 명령 레벨 우선, file 객체 폴백 (덱과 필드 규약 공유)
-  if (const auto it = msg.find("volume"); it != msg.end() && it->is_number()) {
-    track->volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
-  } else if (const auto fit = file.find("volume"); fit != file.end() && fit->is_number()) {
-    track->volume_gain = std::clamp(fit->get<double>(), 0.0, 100.0) / 100.0;
-  }
-  if (msg.value("muted", false) || file.value("muted", false)) track->volume_gain = 0.0;
-  const json* map_src = nullptr;
-  if (const auto it = msg.find("channel_map"); it != msg.end() && it->is_array() && !it->empty())
-    map_src = &*it;
-  else if (const auto fit = file.find("channel_map");
+  // 채널별 config: 명령 레벨(channels/channel_map/volume/muted) 우선, file 폴백.
+  // channels:[{out,volume,muted}] 우선, 없으면 레거시 channel_map.
+  const json* chans = nullptr;
+  if (const auto it = msg.find("channels"); it != msg.end() && it->is_array() && !it->empty())
+    chans = &*it;
+  else if (const auto fit = file.find("channels");
            fit != file.end() && fit->is_array() && !fit->empty())
-    map_src = &*fit;
-  if (map_src) {
-    for (const auto& v : *map_src)
-      track->channel_map.push_back(v.is_number_integer() ? v.get<int>() : -1);
-    track->branch_channels = static_cast<int>(track->channel_map.size());
+    chans = &*fit;
+  if (chans) {
+    for (const auto& c : *chans) track->channel_routes.push_back(ParseChannel(c));
+  } else {
+    const json* map_src = nullptr;
+    if (const auto it = msg.find("channel_map"); it != msg.end() && it->is_array() && !it->empty())
+      map_src = &*it;
+    else if (const auto fit = file.find("channel_map");
+             fit != file.end() && fit->is_array() && !fit->empty())
+      map_src = &*fit;
+    if (map_src) {
+      for (const auto& v : *map_src) {
+        const int out = v.is_number_integer() ? v.get<int>() : -1;
+        track->channel_routes.push_back({out, 1.0f, out < 0});
+      }
+    }
   }
+  if (!track->channel_routes.empty())
+    track->branch_channels = static_cast<int>(track->channel_routes.size());
+  // 마스터 볼륨/뮤트 (명령 우선, file 폴백)
+  if (const auto it = msg.find("volume"); it != msg.end() && it->is_number())
+    track->volume_gain = std::clamp(it->get<double>(), 0.0, 100.0) / 100.0;
+  else if (const auto fit = file.find("volume"); fit != file.end() && fit->is_number())
+    track->volume_gain = std::clamp(fit->get<double>(), 0.0, 100.0) / 100.0;
+  track->master_muted = msg.value("muted", false) || file.value("muted", false);
 
   track->bin = gst_bin_new(("atrack_" + id).c_str());
   track->decode = MakeElement("uridecodebin3", nullptr);
@@ -1528,7 +1631,7 @@ void PlayerCore::ConnectAudioTrack(AudioTrack* track) {
   gst_element_add_pad(track->bin, track->ghost);
 
   track->amix_pad = gst_element_request_pad_simple(amix_, "sink_%u");
-  SetPadMatrix(track->amix_pad, track->branch_channels, output_channels_, track->channel_map);
+  SetPadMatrix(track->amix_pad, track->branch_channels, output_channels_, track->channel_routes);
   gst_pad_set_offset(track->out, static_cast<gint64>(RunningTime()));
   if (gst_pad_link(track->ghost, track->amix_pad) != GST_PAD_LINK_OK) {
     feedback_("error", "audio track: link to mixer failed");
@@ -1610,18 +1713,24 @@ void PlayerCore::AudioTrackSetVolume(const std::string& track_id, double volume)
   if (track->volume_el) g_object_set(track->volume_el, "volume", track->volume_gain, nullptr);
 }
 
-void PlayerCore::AudioTrackSetChannelMap(const std::string& track_id, const json& map) {
+void PlayerCore::AudioTrackSetChannelMap(const std::string& track_id, const json& arg) {
   auto it = audio_tracks_.find(track_id);
-  if (it == audio_tracks_.end() || !map.is_array()) return;
+  if (it == audio_tracks_.end() || !arg.is_array()) return;
   AudioTrack* track = it->second.get();
-  // 라이브 변경: 브랜치 폭(빌드 시 고정)은 유지 — map이 짧으면 나머지 소스채널 뮤트,
-  // 길면 초과분 무시. 폭 자체를 바꾸려면 audio_track_play로 재시작.
-  track->channel_map.clear();
-  for (const auto& v : map)
-    track->channel_map.push_back(v.is_number_integer() ? v.get<int>() : -1);
+  // 라이브 변경: 브랜치 폭(빌드 시 고정)은 유지 — 폭 자체를 바꾸려면 audio_track_play로 재시작.
+  // arg = 채널별 [{out,volume,muted}] (신규) 또는 레거시 [out,...].
+  track->channel_routes.clear();
+  for (const auto& c : arg) {
+    if (c.is_object()) {
+      track->channel_routes.push_back(ParseChannel(c));
+    } else {
+      const int out = c.is_number_integer() ? c.get<int>() : -1;
+      track->channel_routes.push_back({out, 1.0f, out < 0});
+    }
+  }
   if (track->amix_pad) {
     SetPadMatrix(track->amix_pad, track->branch_channels, output_channels_,
-                 track->channel_map);
+                 track->channel_routes);
   }
 }
 

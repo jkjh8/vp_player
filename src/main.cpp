@@ -211,7 +211,8 @@ gboolean SendReady(gpointer) {
   // v2 기능 협상 (§5): 호스트는 이 목록으로 신규 명령 송신을 게이트 — 구버전 조합에서도
   // 안전하게 강하 (v1 호스트는 모르는 피드백 type을 경고 후 무시)
   SendFeedback("capabilities",
-               json{{"features", json::array({"channel_map", "audio_track", "live_routing"})}});
+               json{{"features", json::array({"channel_map", "audio_track", "live_routing",
+                                              "embedded_streams"})}});
   return G_SOURCE_REMOVE;
 }
 
