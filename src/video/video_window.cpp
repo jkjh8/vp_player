@@ -10,8 +10,10 @@ constexpr UINT WM_APP_DESTROY = WM_APP + 2;
 
 VideoWindow::~VideoWindow() { Destroy(); }
 
-bool VideoWindow::Create(int width, int height, CloseHandler on_close) {
+bool VideoWindow::Create(int width, int height, CloseHandler on_close,
+                          FullscreenChangeHandler on_fullscreen_change) {
   on_close_ = std::move(on_close);
+  on_fullscreen_change_ = std::move(on_fullscreen_change);
   HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
   thread_ = std::thread(&VideoWindow::ThreadMain, this, width, height, ready);
   WaitForSingleObject(ready, 5000);
@@ -60,6 +62,12 @@ void VideoWindow::ThreadMain(int width, int height, HANDLE ready_event) {
   }
 }
 
+void VideoWindow::ToggleFullscreenFromKey() {
+  const bool next = !fullscreen_;
+  ApplyFullscreen(next);
+  if (on_fullscreen_change_) on_fullscreen_change_(next);
+}
+
 void VideoWindow::ApplyFullscreen(bool fullscreen) {
   if (fullscreen == fullscreen_) return;
   fullscreen_ = fullscreen;
@@ -102,6 +110,20 @@ LRESULT CALLBACK VideoWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_FULLSCREEN:
       if (self) self->ApplyFullscreen(wp != 0);
       return 0;
+    case WM_SETCURSOR:
+      // 클라이언트 영역(비디오 표시부) 위에서는 항상 커서 숨김 — 테두리/타이틀바 등
+      // 비클라이언트 영역은 기본 처리(크기조절 커서 등)를 유지한다.
+      if (LOWORD(lp) == HTCLIENT) {
+        SetCursor(nullptr);
+        return TRUE;
+      }
+      break;
+    case WM_KEYDOWN:
+      if (wp == VK_F11 && self) {
+        self->ToggleFullscreenFromKey();
+        return 0;
+      }
+      break;
     case WM_APP_DESTROY:
       DestroyWindow(hwnd);
       return 0;

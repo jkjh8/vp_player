@@ -17,6 +17,10 @@ class VideoWindow {
  public:
   // 사용자가 창을 닫을 때 호출 (창 스레드에서 호출됨 — 호출자가 마샬링할 것)
   using CloseHandler = std::function<void()>;
+  // 로컬 F11 키 입력으로 풀스크린 상태가 바뀔 때 호출 (창 스레드에서 호출됨 —
+  // 호출자가 마샬링할 것). 호스트가 명령으로 SetFullscreen()을 호출한 경우는
+  // 호출자(main.cpp)가 이미 피드백을 보내므로 재호출되지 않는다.
+  using FullscreenChangeHandler = std::function<void(bool)>;
 
   VideoWindow() = default;
   ~VideoWindow();
@@ -25,7 +29,8 @@ class VideoWindow {
   VideoWindow& operator=(const VideoWindow&) = delete;
 
   // 창 생성 (블로킹 — 생성 완료 후 반환). 성공 시 true.
-  bool Create(int width, int height, CloseHandler on_close);
+  bool Create(int width, int height, CloseHandler on_close,
+              FullscreenChangeHandler on_fullscreen_change = nullptr);
   void Destroy();
 
   HWND hwnd() const { return hwnd_; }
@@ -39,6 +44,7 @@ class VideoWindow {
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
   void ThreadMain(int width, int height, HANDLE ready_event);
   void ApplyFullscreen(bool fullscreen);
+  void ToggleFullscreenFromKey();  // F11 — 창 스레드에서 직접 호출됨
 
   HWND hwnd_ = nullptr;
   std::thread thread_;
@@ -46,6 +52,7 @@ class VideoWindow {
   std::atomic<uint32_t> bg_rgb_{0x000000};
   RECT windowed_rect_{};  // 풀스크린 해제 시 복원용 (창 스레드에서만 접근)
   CloseHandler on_close_;
+  FullscreenChangeHandler on_fullscreen_change_;
 };
 
 }  // namespace vp

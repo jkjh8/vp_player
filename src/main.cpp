@@ -249,16 +249,31 @@ int main(int argc, char* argv[]) {
   app.loop = g_main_loop_new(nullptr, FALSE);
 
   // 비디오 창 (닫으면 closed 통지 후 종료 — 호스트가 app.quit()으로 이어감)
-  if (!app.window.Create(1280, 720, [] {
-        g_main_context_invoke(
-            nullptr,
-            [](gpointer) -> gboolean {
-              SendFeedback("closed", nullptr);
-              g_main_loop_quit(g_app->loop);
-              return G_SOURCE_REMOVE;
-            },
-            nullptr);
-      })) {
+  if (!app.window.Create(
+          1280, 720,
+          [] {
+            g_main_context_invoke(
+                nullptr,
+                [](gpointer) -> gboolean {
+                  SendFeedback("closed", nullptr);
+                  g_main_loop_quit(g_app->loop);
+                  return G_SOURCE_REMOVE;
+                },
+                nullptr);
+          },
+          // 로컬 F11 키로 풀스크린이 바뀌면 호스트 명령 경로(set_fullscreen)와 동일하게
+          // 피드백을 보내 pStatus.fullscreen을 동기화한다.
+          [](bool value) {
+            g_main_context_invoke(
+                nullptr,
+                [](gpointer data) -> gboolean {
+                  const bool v = *static_cast<bool*>(data);
+                  delete static_cast<bool*>(data);
+                  SendFeedback("set_fullscreen", v);
+                  return G_SOURCE_REMOVE;
+                },
+                new bool(value));
+          })) {
     fprintf(stderr, "FATAL: cannot create video window\n");
     return 1;
   }

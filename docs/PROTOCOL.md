@@ -412,6 +412,8 @@
 ```
 - `value`: bool (누락 시 false). 창을 전체화면/일반으로 전환.
 - 피드백: `{"type":"set_fullscreen","data":{"value":true}}` — 호스트가 이를 받아 DB에 영속화하므로 **반드시 발신**.
+- **로컬 F11 키**로도 동일 토글 발생 (호스트 명령 없이 창이 포커스된 상태에서 F11 — 전체화면 진입/해제 모두). 이 경우도 위와 동일한 `set_fullscreen` 피드백을 발신해 호스트 `pStatus.fullscreen`을 동기화한다 (video_window.cpp `ToggleFullscreenFromKey`).
+- 비디오 창의 클라이언트 영역 위에서는 마우스 커서를 항상 숨김(`WM_SETCURSOR`) — 키오스크/사이니지 표시용, 창 테두리 등 비클라이언트 영역은 기본 커서 유지.
 
 #### `background_color`
 ```json
