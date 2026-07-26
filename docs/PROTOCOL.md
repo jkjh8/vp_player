@@ -724,17 +724,17 @@ function handleEndReached(data) {
 | 명령 | `audio_track_set_volume` | H→P | `{track_id, volume: 0-100}` | 트랙 볼륨 |
 | 명령 | `audio_track_set_channel_map` | H→P | `{track_id, map:[출력채널 인덱스,...]}` | 채널 라우팅 |
 | 피드백 | `audio_track_data` | P→H | `{track_id, time, duration, position, is_playing, state}` (단위는 v1과 동일: ms / 0–1) | 독립 오디오 트랙 상태 틱 |
-| 명령 | `set_timeline` | H→P | `{timeline_id, cues:[{at_ms, action, ...}]}` | 타임라인(큐 시트) 로드 |
-| 명령 | `timeline_play` / `timeline_pause` / `timeline_seek` | H→P | `{timeline_id}` / `{timeline_id}` / `{timeline_id, time_ms}` | 타임라인 트랜스포트 |
-| 피드백 | `timeline_cue_ready` | P→H | `{timeline_id, cue_id}` | 큐 프리롤 완료 |
-| 피드백 | `timeline_cue_late` | P→H | `{timeline_id, cue_id, late_ms}` | 큐 지연 발화 경고 |
-| 피드백 | `timeline_position` | P→H | `{timeline_id, time_ms}` | 타임라인 위치 틱 |
+| 명령 | `set_timeline` | H→P | `{timeline_id, duration_ms, tracks:[{track_id, type, order, mute, volume, channel_map, clips:[...]}]}` | 타임라인(트랙/클립 시트) 로드 — 확정 명세는 §5.2 |
+| 명령 | `timeline_play` / `timeline_pause` / `timeline_seek` / `timeline_stop` | H→P | `{time_ms?}` / `{}` / `{time_ms}` / `{}` | 타임라인 트랜스포트 |
+| 피드백 | `timeline_cue_ready` | P→H | `{timeline_id, clip_id}` | 클립 프리롤 완료(진단) |
+| 피드백 | `timeline_cue_late` | P→H | `{timeline_id, clip_id, late_ms}` | 클립 지연 발화 경고 |
+| 피드백 | `timeline_position` | P→H | `{timeline_id, time_ms, duration_ms, is_playing}` | 타임라인 위치 틱(250ms) |
 | 명령 | `get_audio_device_caps` | H→P | 응답 피드백 `audio_device_caps {"devices":[{deviceId, name, type:"wasapi"\|"asio", channels:int}]}` — WASAPI는 8ch 기준, ASIO는 드라이버가 보고하는 채널 수 | 멀티채널 출력 능력 조회 (v1 `get_audio_devices`/`audiodevices` 는 그대로 유지) |
 
 ### 5.1 v2 구현 명세 — 멀티채널 라우팅 + 독립 오디오 트랙 (2026-07-10 구현 완료)
 
 위 표에서 `audio_track_*`, `get_audio_device_caps`, `capabilities` 는 구현 완료. 타임라인
-(`set_timeline`/`timeline_*`) 은 계속 예약 상태. 확정 시맨틱:
+(`set_timeline`/`timeline_*`) 확정 명세는 **§5.2** (Phase B). 확정 시맨틱:
 
 **오디오 버스 정책.** 믹서 출력 채널수 N 은 `set_audio_device` 시 디바이스를 따른다 —
 wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio = 드라이버 보고
@@ -791,13 +791,64 @@ wasapi = min(디바이스 채널, 8) + positioned(표준 fallback mask) / asio =
   `audio_track_stop` 으로 관리한다 (repeat 모드별 정책은 호스트 소관).
 
 **기능 협상.** ready 직후 피드백
-`capabilities {"features":["channel_map","audio_track","live_routing","embedded_streams"]}` 발신.
+`capabilities {"features":["channel_map","audio_track","live_routing","embedded_streams","timeline"]}` 발신
+(`timeline` 은 Phase B 구현 후 추가 — §5.2).
 호스트는 이 목록에 있는 기능만 송신한다 (구버전 플레이어 = 목록 부재 = v1 강하).
 ready/capabilities 는 **첫 TCP 클라이언트 연결 후** 발신된다 (§4 의 500ms 레이스 해소 —
 연결 전이면 500ms 주기로 재시도).
 
 검증: `test/smoke7.js` (라우팅/디바이스 전환), `test/smoke8.js` (병행/루프/수명주기),
 `test/smoke9.js` (채널별 gain/mute/라우팅 + 마스터 볼륨/뮤트 라이브 + 레거시 회귀).
+
+### 5.2 v2 구현 명세 — 타임라인 모드 (Phase B)
+
+NLE(비선형 편집) 식 타임라인. 클립을 시간축에 자유 배치(갭 허용), **비디오는 어느 시점이든
+플레이헤드 아래 `order` 가 가장 위(0=최상위)인 트랙의 클립 하나만 출력**(단일 비디오 출력),
+오디오는 트랙별 출력 채널 라우팅으로 동시 재생한다. 클록은 **플레이어가 소유**하고 호스트는
+트랜스포트 패스스루만 한다.
+
+**`set_timeline {timeline_id, duration_ms, tracks:[...]}` (H→P).** 타임라인 시트를 로드(교체).
+재생 중 전송하면 정지 후 재구성. 트랙/클립 구조:
+```
+"tracks": [
+  { "track_id":"tr-…", "type":"video"|"audio", "order":0,   // order = z순서(0=최상위, 비디오만 유효)
+    "mute":false, "volume":100,                             // 트랙 마스터 볼륨/뮤트(0-100)
+    "channel_map":[0,1],                                    // 오디오 트랙 레벨 라우팅(§5.1 시맨틱), 비디오는 무시
+    "clips":[
+      { "clip_id":"cl-…", "file":{…},                       // file = v1 file 객체(path/uuid/mimetype 등)
+        "start_ms":0,                                       // 타임라인상 시작 시각
+        "in_ms":0, "out_ms":30000,                          // 소스 인/아웃(클립 길이 = out-in), 이미지는 in_ms=0 / out_ms=표시시간
+        "volume":100,                                       // 클립 볼륨(트랙 볼륨과 곱)
+        "fade_in_ms":0, "fade_out_ms":0 } ]                 // Phase C 예약(현재 미적용)
+  }
+]
+```
+- `type:"video"` 트랙은 **이미지 클립도 포함**(file mimetype 으로 구분). 이미지 클립 = imagefreeze,
+  표시시간 = `out_ms - in_ms`.
+- **비디오 = 기존 듀얼 덱 재사용.** topmost 규칙상 어느 시점이든 보이는 비디오는 1개 → 타임라인을
+  가시 세그먼트 시퀀스로 컴파일, 각 에지 2초 전 standby 덱에 인포인트(`in_ms + 진입오프셋`) 시크로
+  프리롤 → 에지에서 스왑. 갭 = compositor 배경색.
+- **오디오 클립 = 독립 오디오 트랙(§5.1) 인스턴스.** 스케줄러가 에지에서 기동/정지, 시작 오프셋
+  시크(`in_ms`), matrix = 트랙 `channel_map`, 실효 볼륨 = 트랙 volume × 클립 volume. 동시 클립 = 동시
+  오디오 트랙(§5.1 상한 8 공유).
+- 유효 시간 단위 = ms. `duration_ms` 부재 시 최대 clip end 로 산출.
+
+**트랜스포트 (H→P).** 전부 현재 로드된 타임라인 대상 (timeline_id 생략 가능).
+- `timeline_play {time_ms?}` — `time_ms` 부터(부재=현재 위치 또는 0) 재생.
+- `timeline_pause {}` — 토글(전 덱/트랙 패드블록 + epoch 동결).
+- `timeline_seek {time_ms}` — 해체 후 신규 시각 기준 재구성.
+- `timeline_stop {}` — 해체 + 초기화(위치 0). 이후 `logo_visibility {"show":true}`.
+
+**피드백 (P→H).**
+- `timeline_position {timeline_id, time_ms, duration_ms, is_playing}` — 250ms 틱(재생/일시정지 중).
+- `timeline_cue_ready {timeline_id, clip_id}` / `timeline_cue_late {timeline_id, clip_id, late_ms}` —
+  프리롤 진단(선택, 호스트는 warn 로그).
+
+**모드 상호배타.** 타임라인 재생 중에는 덱의 `media_changed`/`end_reached`/`player_data` 를 억제
+(플레이리스트 진행 로직 오작동 방지). 타임라인/플레이리스트 모드는 호스트에서 상호배타.
+
+**기능 협상.** `capabilities.features` 에 `"timeline"` 포함 시에만 호스트가 `set_timeline`/`timeline_*`
+전송. 검증: `test/smoke10.js` (2 비디오 트랙 z순서 + 갭 + 오디오 클립 동시, in_ms 트림 진입, 시크/일시정지).
 
 ---
 
