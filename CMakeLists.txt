@@ -64,6 +64,7 @@ add_executable(vplayer
   src/player/player_core.cpp
   src/player/player_timeline.cpp
   src/video/video_window.cpp
+  src/video/tray_icon.cpp
   src/video/display_enum.cpp
   src/media/probe.cpp
   src/app.manifest
@@ -76,6 +77,7 @@ target_link_libraries(vplayer PRIVATE
   lunasvg
   ws2_32
   psapi
+  shell32
 )
 
 target_compile_options(vplayer PRIVATE /utf-8 /W4 /EHsc)

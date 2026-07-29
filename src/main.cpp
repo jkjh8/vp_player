@@ -22,6 +22,7 @@
 #include "net/tcp_server.h"
 #include "player/player_core.h"
 #include "video/display_enum.h"
+#include "video/tray_icon.h"
 #include "video/video_window.h"
 
 using json = nlohmann::json;
@@ -31,7 +32,8 @@ namespace {
 struct App {
   GMainLoop* loop = nullptr;
   vp::NdjsonServer server;
-  vp::PlayerCore core;  // 창(Surface)은 core가 소유 — 동적 생성/삭제
+  vp::PlayerCore core;  // 창(Surface)은 core가 소유 — 동적 생성/삭제 (자동 주 창 없음)
+  vp::TrayIcon tray;    // 실행 표시 + 종료
 };
 
 App* g_app = nullptr;
@@ -41,8 +43,10 @@ void SendFeedback(const std::string& type, const json& data) {
   g_app->server.SendLine(msg.dump());
 }
 
-// window_id는 멀티 윈도우 주소 (없으면 0 = 주 창, 하위호환)
-int WindowIdOf(const json& msg) { return msg.value("window_id", 0); }
+// window_id 주소. 명시되면 그 값, 없으면 기본 창(존재하는 첫 창) — 주 창 개념 폐지.
+int WindowIdOf(const json& msg) {
+  return msg.contains("window_id") ? msg.value("window_id", 0) : g_app->core.DefaultWindowId();
+}
 
 // {monitor_index,x,y,width,height} → WindowPlacement
 vp::WindowPlacement PlacementFromJson(const json& msg) {
@@ -62,31 +66,6 @@ std::string TrackIdOf(const json& msg) {
   if (it->is_string()) return it->get<std::string>();
   if (it->is_number_integer()) return std::to_string(it->get<long long>());
   return "";
-}
-
-// --monitor=1 --x=0 --y=0 --width=1920 --height=1080 --aspect=letterbox
-vp::WindowPlacement ParsePlacementFromArgs(int argc, char** argv, std::string* aspect_mode) {
-  vp::WindowPlacement placement;
-  *aspect_mode = "letterbox";
-  for (int i = 1; i < argc; i++) {
-    const std::string arg = argv[i];
-    if (arg.rfind("--", 0) != 0) continue;
-    const auto eq = arg.find('=');
-    if (eq == std::string::npos) continue;
-    const std::string key = arg.substr(2, eq - 2);
-    const std::string val = arg.substr(eq + 1);
-    try {
-      if (key == "monitor") placement.monitor_index = std::stoi(val);
-      else if (key == "x") placement.x = std::stoi(val);
-      else if (key == "y") placement.y = std::stoi(val);
-      else if (key == "width") placement.width = std::stoi(val);
-      else if (key == "height") placement.height = std::stoi(val);
-      else if (key == "aspect") *aspect_mode = val;
-    } catch (const std::exception&) {
-      // 잘못된 값은 기본값 유지
-    }
-  }
-  return placement;
 }
 
 // "#RRGGBB" / "RRGGBB" → 0xRRGGBB
@@ -380,33 +359,32 @@ int main(int argc, char* argv[]) {
   g_app = &app;
   app.loop = g_main_loop_new(nullptr, FALSE);
 
-  std::string initial_aspect_mode;
-  const vp::WindowPlacement initial_placement =
-      ParsePlacementFromArgs(argc, argv, &initial_aspect_mode);
-
-  // 공유 파이프라인 + 전역 오디오 버스 구성 (창은 아래에서 별도 생성)
+  // 공유 파이프라인 + 전역 오디오 버스 구성. 창은 호스트가 create_window로 필요할 때 생성
+  // (자동 주 창 없음 — 사용자가 설정한 창만 열린다).
   if (!app.core.Init(SendFeedback)) {
     fprintf(stderr, "FATAL: player core init failed\n");
     return 1;
   }
 
-  // 창(Surface) 닫힘: 주 창(0)이 닫히면 closed 통지 후 종료, 그 외 창은 해체만 하고 통지.
+  // 창 닫힘: 해당 창만 해체하고 통지 (주 창 개념 없음 — 창을 닫아도 프로그램은 유지,
+  // 종료는 트레이 메뉴로). 사용자가 실수로 창을 닫아도 앱은 계속 실행.
   app.core.SetSurfaceClosedHandler([](int window_id) {
-    if (window_id == 0) {
-      SendFeedback("closed", nullptr);
-      g_main_loop_quit(g_app->loop);
-    } else {
-      g_app->core.DestroySurface(window_id);
-      SendFeedback("windows", json{{"windows", g_app->core.ListSurfaces()},
-                                   {"destroyed", window_id}});
-    }
+    g_app->core.DestroySurface(window_id);
+    SendFeedback("windows",
+                 json{{"windows", g_app->core.ListSurfaces()}, {"destroyed", window_id}});
   });
 
-  // 주 창(window_id=0) 생성
-  if (!app.core.CreateSurface(0, initial_placement, initial_aspect_mode)) {
-    fprintf(stderr, "FATAL: cannot create video window\n");
-    return 1;
-  }
+  // 트레이 아이콘 — 실행 표시 + 종료 메뉴 (창이 없어도 프로그램 제어 가능)
+  app.tray.Create(L"VP App — 실행 중", [] {
+    g_main_context_invoke(
+        nullptr,
+        [](gpointer) -> gboolean {
+          SendFeedback("closed", nullptr);
+          g_main_loop_quit(g_app->loop);
+          return G_SOURCE_REMOVE;
+        },
+        nullptr);
+  });
 
   const uint16_t port = app.server.Start(1300, [](std::string line) {
     g_main_context_invoke(nullptr, DispatchLineIdle, new std::string(std::move(line)));
@@ -427,6 +405,7 @@ int main(int argc, char* argv[]) {
   g_main_loop_run(app.loop);
 
   app.server.Stop();
+  app.tray.Destroy();
   app.core.Shutdown();  // 전 창(창 스레드 join 포함) + 파이프라인 해체
   g_main_loop_unref(app.loop);
   return 0;

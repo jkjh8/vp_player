@@ -63,6 +63,13 @@ class PlayerCore {
                      const std::string& aspect_mode = "letterbox");
   void DestroySurface(int window_id);
   bool HasSurface(int window_id) const { return surfaces_.count(window_id) > 0; }
+  // 기본 대상 창 id — 주 창 개념 폐지 후 window_id 미지정 명령의 라우팅 대상.
+  // 창 0이 있으면 0, 없으면 존재하는 첫 창, 아무 창도 없으면 0.
+  int DefaultWindowId() const {
+    if (surfaces_.count(0)) return 0;
+    if (!surfaces_.empty()) return surfaces_.begin()->first;
+    return 0;
+  }
   nlohmann::json ListSurfaces() const;  // get_windows 피드백용
   // 엔진 통계 (memory_status 피드백용): 창/라이브덱/프리롤덱/오디오트랙 수
   nlohmann::json EngineStats() const;
@@ -171,7 +178,7 @@ class PlayerCore {
   // ---- 서피스 조회/구성 헬퍼 ----
   Surface* GetSurface(int window_id);
   const Surface* GetSurface(int window_id) const;
-  Surface* DefaultSurface() { return GetSurface(0); }  // 타임라인/레거시 경로 기준 창
+  Surface* DefaultSurface() { return GetSurface(DefaultWindowId()); }  // 타임라인/레거시 기준 창
   bool BuildSurfaceGraph(Surface* s);   // comp/vsink/bg/logo 브랜치 생성·링크
   void TeardownSurfaceGraph(Surface* s);
   bool InitLogoBranch(Surface* s);

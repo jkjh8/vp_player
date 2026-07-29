@@ -1186,6 +1186,23 @@ void PlayerCore::TeardownDeck(Deck* deck) {
   }
   deck->state = Deck::State::Dead;
 
+  // 중요(데드락 방지): NULL 전환 전에 comp/amix에서 먼저 분리한다. 라이브 amix/comp에 연결된
+  // 채로 bin을 NULL로 내리면 스트리밍 스레드가 믹서로의 push에서 막혀 set_state(NULL)이
+  // 영구 대기(특정 오디오 디바이스/2덱 동시 상황에서 재현) → 정지가 전 창에 안 먹힘.
+  // 고스트 패드를 먼저 언링크·요청 패드 해제해 bin을 고립시키면 NULL이 블록되지 않는다.
+  if (deck->comp_pad) {
+    if (deck->video_ghost) gst_pad_unlink(deck->video_ghost, deck->comp_pad);
+    if (s && s->comp) gst_element_release_request_pad(s->comp, deck->comp_pad);
+    gst_object_unref(deck->comp_pad);
+    deck->comp_pad = nullptr;
+  }
+  if (deck->amix_pad) {
+    if (deck->audio_ghost) gst_pad_unlink(deck->audio_ghost, deck->amix_pad);
+    gst_element_release_request_pad(amix_, deck->amix_pad);
+    gst_object_unref(deck->amix_pad);
+    deck->amix_pad = nullptr;
+  }
+
   if (deck->video_block) {
     gst_pad_remove_probe(deck->video_out, deck->video_block);
     deck->video_block = 0;
@@ -1198,16 +1215,6 @@ void PlayerCore::TeardownDeck(Deck* deck) {
   gst_element_set_locked_state(deck->bin, TRUE);
   gst_element_set_state(deck->bin, GST_STATE_NULL);
 
-  if (deck->comp_pad) {
-    if (deck->video_ghost) gst_pad_unlink(deck->video_ghost, deck->comp_pad);
-    if (s && s->comp) gst_element_release_request_pad(s->comp, deck->comp_pad);
-    gst_object_unref(deck->comp_pad);
-  }
-  if (deck->amix_pad) {
-    if (deck->audio_ghost) gst_pad_unlink(deck->audio_ghost, deck->amix_pad);
-    gst_element_release_request_pad(amix_, deck->amix_pad);
-    gst_object_unref(deck->amix_pad);
-  }
   if (deck->video_out) gst_object_unref(deck->video_out);
   if (deck->audio_out) gst_object_unref(deck->audio_out);
 
