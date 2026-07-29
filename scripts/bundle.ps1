@@ -30,8 +30,8 @@ New-Item -ItemType Directory -Force $outPlugins | Out-Null
 $pluginNames = @(
   # 코어/재생 골격
   'coreelements','playback','typefindfunctions','app','autodetect',
-  # 비디오 합성/변환 (d3d11 = HW 디코더+compositor+sink 포함)
-  'compositor','d3d11','videoconvertscale','imagefreeze','videotestsrc',
+  # 비디오 합성/변환 (d3d11 = HW 디코더+compositor+sink 포함, videocrop = aspectratiocrop)
+  'compositor','d3d11','videoconvertscale','imagefreeze','videotestsrc','videocrop',
   # 오디오 경로
   'audioconvert','audioresample','audiomixer','volume','wasapi2','audiotestsrc',
   # 컨테이너/파서

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(vplayer VERSION 0.1.0 LANGUAGES CXX)
+project(vplayer VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +32,7 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
   gstreamer-audio-1.0
   gstreamer-pbutils-1.0
   gstreamer-app-1.0
+  gstreamer-net-1.0
 )
 
 # --- 서드파티 (FetchContent) ---------------------------------------------------
@@ -61,7 +62,9 @@ add_executable(vplayer
   src/main.cpp
   src/net/tcp_server.cpp
   src/player/player_core.cpp
+  src/player/player_timeline.cpp
   src/video/video_window.cpp
+  src/video/display_enum.cpp
   src/media/probe.cpp
   src/app.manifest
 )
@@ -72,6 +75,7 @@ target_link_libraries(vplayer PRIVATE
   nlohmann_json::nlohmann_json
   lunasvg
   ws2_32
+  psapi
 )
 
 target_compile_options(vplayer PRIVATE /utf-8 /W4 /EHsc)

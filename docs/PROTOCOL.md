@@ -881,3 +881,82 @@ P→H {"type":"info","data":"Preloading updated next track 2: ..."}
         ... 이미지 타이머 만료 ...
 P→H {"type":"end_reached","data":{"playlist_track_index":1,"active_player_id":1}}   ← 키 "1-1" ≠ "0-0"
 ```
+
+---
+
+# §6 멀티 윈도우 · 트랙별 지연 · 전 트랙 프리롤 · 메모리 상태 (v3)
+
+v3는 단일 출력창을 **다중 창(동시 재생)** 으로 확장한다. 기존 v1/v2 명령은 `window_id`
+필드(생략 시 0 = 주 창)만 추가되어 하위호환된다. `capabilities.features`에
+`"multi_window"`, `"track_delay"`, `"memory_status"` 가 추가된다.
+
+모델: 창(Surface)마다 독립 컴포지터/비디오싱크/듀얼덱/배경/로고. **오디오 버스(믹서+출력
+sink)는 전역 공유** — 전 창의 모든 덱이 하나의 amix로 믹스된다. 파이프라인 클록은 전역 1개
+(창 간, 그리고 멀티 PC PTP 동기의 기준).
+
+## 6.1 창 생명주기
+
+- `create_window {window_id, monitor_index?, x?, y?, width?, height?, aspect_mode?}`
+  창을 동적 생성(테두리 없는 borderless Win32 창 + comp/vsink/배경/로고). 주 창(0)은 부팅 시
+  자동 생성됨.
+- `destroy_window {window_id}` 창 해체 (해당 창의 덱/풀 정리 + 창 파괴).
+- `get_windows` → `P→H {"type":"windows","data":{"windows":[{window_id,aspect_mode,width,height,fullscreen}, ...]}}`
+- 창 생성/삭제 응답도 `windows` 피드백으로 최신 목록을 함께 보낸다(`created`/`destroyed` 키 포함).
+
+## 6.2 window_id 주소 (기존 명령 확장)
+
+다음 명령은 `window_id`(기본 0)로 대상 창을 지정한다:
+`playid`/`set_media`, `play_current_and_load_next`, `preload_next`, `next`, `play`, `pause`,
+`stop`, `set_time`, `set_fullscreen`, `background_color`, `set_display`, `set_deck_audio`,
+`show_logo`, `logo_file`, `logo_size`. `stop_all`은 전 창 정지(+오디오 트랙 전부).
+
+피드백에도 `window_id`가 실린다: `media_changed`, `end_reached`, `player_data`,
+`active_player_id`, `track_index`, `logo_visibility`, `set_fullscreen`, `set_display`.
+
+**덱 dedup 키 확장:** end_reached 중복 제거 키는 `${window_id}-${playlist_track_index}-${active_player_id}`
+(§4-②의 창별 확장). 창마다 active_player_id(0/1)는 독립적으로 교대한다.
+
+동시 재생: 여러 창에 각각 `play_current_and_load_next`를 보내면 창들이 병렬로 재생된다.
+비디오는 창별 comp로 독립 렌더, 오디오는 공유 amix로 합쳐진다(창별 채널 라우팅 유지).
+
+## 6.3 트랙별 시작 지연 (delay_ms)
+
+file 객체에 `delay_ms`(정수, ms, 0=즉시). 덱 프리롤 완료 후 **delay_ms 만큼 대기했다가**
+실제 표시(스왑)한다. 지연 동안 대상 창은 배경색을 표시한다. 이미지 표시시간(`time`, 초)과는
+독립적이다.
+
+```
+H→P {"command":"play_current_and_load_next","window_id":0,"track_idx":0,
+     "current":{"path":"...","uuid":"A","delay_ms":1500}}
+     ... 프리롤 완료 후 1.5초 대기(배경색) → 표시 ...
+P→H {"type":"media_changed","data":{"idx":0,"window_id":0,"uuid":"A", ...}}
+```
+
+## 6.4 전 트랙 프리롤 (preload pool)
+
+플레이리스트 로딩 시 전 트랙을 디코더에 미리 프리롤해 전환/재생 지연을 없앤다. 창별 A/B
+라이브 슬롯과 별개로 **프리롤 풀**(파킹된 대기 덱들)을 유지한다.
+
+- `set_preload_config {lookahead?, max_decks?}`
+  - `lookahead`(0~32, 기본 1): 창당 라이브 트랙 앞으로 미리 프리롤할 트랙 수. 1=기존 1-ahead.
+  - `max_decks`(1~64, 기본 8): **전역 동시 프리롤 덱 상한**. 초과 시 먼 트랙은 프리롤을
+    생략(메타데이터만 유지 = 자동 강등)하고 `debug`로 알린다.
+- `preload_playlist {window_id, tracks:[file, ...], current_index?}`
+  창의 전체 시퀀스를 등록하고 `[current_index .. current_index+lookahead]`를 풀에 프리롤한다.
+  이후 재생/전환 명령이 **경로가 일치하는 풀 덱을 즉시 승격(swap)** 하므로 지연이 없다. 라이브
+  트랙이 바뀔 때마다 풀은 자동 리필된다. `stop`/`stop_all`/`destroy_window`에서 풀은 해제된다.
+
+진행/리핏 판단은 여전히 호스트가 담당한다(§4-④). 풀은 호스트가 보내는 재생 명령을 가속할 뿐,
+자동 진행하지 않는다.
+
+## 6.5 메모리 상태 (memory_status)
+
+플레이어가 1초 주기로 발신 (전 트랙 프리롤의 메모리 압박을 호스트/UI가 가시화):
+
+```
+P→H {"type":"memory_status","data":{
+  "surfaces": 2, "live_decks": 2, "prerolled_decks": 4, "pool_decks": 3, "audio_tracks": 0,
+  "rss_bytes": 512319488, "private_bytes": 530178048,
+  "sys_total_bytes": 34293301248, "sys_avail_bytes": 12000000000, "sys_load_percent": 65
+}}
+```
