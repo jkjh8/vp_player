@@ -262,6 +262,12 @@ bool PlayerCore::Init(FeedbackFn feedback) {
     feedback_("error", "failed to link audio output stage");
     return false;
   }
+  // 출력 채널별 지연 라인 — bus_caps 출력(Nch F32LE 인터리브)에 in-place 프로브. 기본 패스스루.
+  {
+    GstPad* bp = gst_element_get_static_pad(bus_caps_, "src");
+    gst_pad_add_probe(bp, GST_PAD_PROBE_TYPE_BUFFER, OnBusAudioProbe, this, nullptr);
+    gst_object_unref(bp);
+  }
   {
     gst_element_link_many(silence, silence_conv, silence_caps, nullptr);
     GstPad* src = gst_element_get_static_pad(silence_caps, "src");
@@ -1697,6 +1703,82 @@ void PlayerCore::SetAudioDevice(const std::string& device_id) {
   gst_object_unref(src);
 }
 
+// 출력 채널별 지연 링버퍼 재구성 (락 보유 상태에서 호출) — output_channels_ 기준.
+static void RebuildRingsLocked(int out_ch, const std::vector<int>& delay_ms,
+                               std::vector<int>& delay_samples,
+                               std::vector<std::vector<float>>& rings, std::vector<int>& wpos,
+                               int& ring_len, bool& active) {
+  const int N = std::max(0, out_ch);
+  delay_samples.assign(N, 0);
+  int maxd = 0;
+  for (int c = 0; c < N; ++c) {
+    const int ms = c < static_cast<int>(delay_ms.size()) ? std::max(0, delay_ms[c]) : 0;
+    const int s = ms * 48;  // 48kHz
+    delay_samples[c] = s;
+    maxd = std::max(maxd, s);
+  }
+  ring_len = maxd + 1;
+  rings.assign(N, std::vector<float>(ring_len, 0.0f));
+  wpos.assign(N, 0);
+  active = maxd > 0;
+}
+
+void PlayerCore::SetChannelDelays(const json& delays) {
+  std::lock_guard<std::mutex> lk(delay_mtx_);
+  channel_delay_ms_.clear();
+  if (delays.is_array()) {
+    for (const auto& v : delays)
+      channel_delay_ms_.push_back(v.is_number() ? std::max(0, static_cast<int>(v.get<double>())) : 0);
+  }
+  RebuildRingsLocked(output_channels_, channel_delay_ms_, chan_delay_samples_, chan_ring_,
+                     chan_wpos_, delay_ring_len_, delays_active_);
+  int maxms = 0;
+  for (int m : channel_delay_ms_) maxms = std::max(maxms, m);
+  feedback_("debug", "channel delays set (" + std::to_string(channel_delay_ms_.size()) +
+                         " ch, max " + std::to_string(maxms) + "ms)");
+}
+
+void PlayerCore::RebuildDelayRings() {
+  std::lock_guard<std::mutex> lk(delay_mtx_);
+  RebuildRingsLocked(output_channels_, channel_delay_ms_, chan_delay_samples_, chan_ring_,
+                     chan_wpos_, delay_ring_len_, delays_active_);
+}
+
+GstPadProbeReturn PlayerCore::OnBusAudioProbe(GstPad*, GstPadProbeInfo* info, gpointer user) {
+  auto* self = static_cast<PlayerCore*>(user);
+  if (!self->delays_active_) return GST_PAD_PROBE_OK;  // 패스스루 (racy read 무해)
+
+  GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+  buf = gst_buffer_make_writable(buf);
+  GST_PAD_PROBE_INFO_DATA(info) = buf;
+
+  GstMapInfo map;
+  if (!gst_buffer_map(buf, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
+
+  std::lock_guard<std::mutex> lk(self->delay_mtx_);
+  const int N = self->output_channels_;
+  if (N <= 0 || static_cast<int>(self->chan_ring_.size()) != N) {
+    gst_buffer_unmap(buf, &map);
+    return GST_PAD_PROBE_OK;
+  }
+  const int L = self->delay_ring_len_;
+  float* d = reinterpret_cast<float*>(map.data);
+  const int frames = static_cast<int>(map.size / (sizeof(float) * N));
+  for (int f = 0; f < frames; ++f) {
+    for (int c = 0; c < N; ++c) {
+      auto& ring = self->chan_ring_[c];
+      int wp = self->chan_wpos_[c];
+      ring[wp] = d[f * N + c];              // 입력 저장
+      int rp = wp - self->chan_delay_samples_[c];  // 지연만큼 과거 샘플 읽기
+      if (rp < 0) rp += L;
+      d[f * N + c] = ring[rp];
+      self->chan_wpos_[c] = (wp + 1) % L;
+    }
+  }
+  gst_buffer_unmap(buf, &map);
+  return GST_PAD_PROBE_OK;
+}
+
 void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned) {
   gst_element_set_locked_state(audio_sink_, TRUE);
   gst_element_set_state(audio_sink_, GST_STATE_NULL);
@@ -1719,6 +1801,7 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, boo
       if (t && t->amix_pad)
         SetPadMatrix(t->amix_pad, t->branch_channels, output_channels_, t->channel_routes);
     }
+    RebuildDelayRings();  // 출력 채널수 변경 → 지연 링버퍼 재구성 (delays 유지)
   }
 
   if (device_id.rfind("asio:", 0) == 0) {

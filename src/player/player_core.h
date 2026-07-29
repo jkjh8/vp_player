@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -110,6 +111,9 @@ class PlayerCore {
 
   nlohmann::json ListAudioDevices();                  // wasapi2/asio 프로바이더
   void SetAudioDevice(const std::string& device_id);  // 라이브 전환 (sink 교체) — 전역
+  // 출력 채널별 오디오 지연(ms) — 스피커 거리/동기 보정. 믹서 출력(전 소스 합산)에 적용되므로
+  // 임베디드 오디오 + 추가 오디오 트랙 모두에 걸린다. delays = [ms, ms, ...] (출력 채널 순서).
+  void SetChannelDelays(const nlohmann::json& delays);
   // 활성 덱(임베디드 오디오)의 라우팅/볼륨/뮤트 라이브 변경. msg={channel_map?,volume?,muted?}.
   void SetDeckAudio(const nlohmann::json& msg, int window_id = 0);
 
@@ -235,6 +239,9 @@ class PlayerCore {
   static void OnAudioTrackPadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static GstBusSyncReply OnBusSync(GstBus* bus, GstMessage* msg, gpointer user_data);
   static gboolean OnBusMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
+  // 출력 채널별 지연 라인 (bus_caps src 패드 버퍼 프로브 — 인터리브 F32LE in-place)
+  static GstPadProbeReturn OnBusAudioProbe(GstPad*, GstPadProbeInfo*, gpointer);
+  void RebuildDelayRings();  // output_channels_ 기준 링버퍼 재구성 (delays 유지) — 락 획득
 
   FeedbackFn feedback_;
   SurfaceClosedFn on_surface_closed_;
@@ -249,6 +256,15 @@ class PlayerCore {
   int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)
   bool bus_positioned_ = true;       // true = fallback mask, false = unpositioned(asio)
   bool use_d3d11_ = true;
+
+  // 출력 채널별 지연 라인 (스트리밍 스레드 프로브 ↔ 메인 스레드 설정 — 뮤텍스 보호)
+  std::mutex delay_mtx_;
+  std::vector<int> channel_delay_ms_;       // 사용자 설정 (ms/출력채널)
+  std::vector<int> chan_delay_samples_;     // ms → 48kHz 샘플
+  std::vector<std::vector<float>> chan_ring_;  // 채널별 링버퍼
+  std::vector<int> chan_wpos_;              // 채널별 write 위치
+  int delay_ring_len_ = 1;
+  bool delays_active_ = false;              // 하나라도 >0 이면 처리 (아니면 패스스루)
 
   // 멀티 PC PTP 동기 (Phase 5). 기본 비활성 = 시스템 클록.
   GstClock* ptp_clock_ = nullptr;

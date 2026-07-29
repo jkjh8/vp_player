@@ -203,6 +203,8 @@ void HandleCommand(const json& msg) {
     SendFeedback("audio_device_caps", json{{"devices", core.ListAudioDevices()}});
   } else if (cmd == "set_audio_device") {
     core.SetAudioDevice(msg.value("device_id", ""));
+  } else if (cmd == "set_channel_delays") {
+    core.SetChannelDelays(msg.value("delays", json::array()));
   } else if (cmd == "set_deck_audio") {
     // 활성 덱(임베디드 오디오) 라이브 라우팅/볼륨/뮤트
     core.SetDeckAudio(msg, wid);
@@ -323,7 +325,7 @@ gboolean SendReady(gpointer) {
                json{{"features",
                      json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
                                   "display", "timeline", "multi_window", "track_delay",
-                                  "memory_status", "ptp_sync"})}});
+                                  "memory_status", "ptp_sync", "channel_delay"})}});
   return G_SOURCE_REMOVE;
 }
 
