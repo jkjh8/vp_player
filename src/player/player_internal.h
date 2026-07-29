@@ -120,6 +120,10 @@ struct PlayerCore::AudioTrack {
   int branch_channels = 2;
   double volume_gain = 1.0;
   bool master_muted = false;
+
+  // 오디오 트랙별 시작 지연(ms): 프리롤 완료 후 amix 연결(ConnectAudioTrack)까지 대기.
+  gint64 delay_ms = 0;
+  guint delay_timer = 0;
 };
 
 // ---------------------------------------------------------------------------

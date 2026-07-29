@@ -1961,6 +1961,7 @@ void PlayerCore::AudioTrackPlay(const json& msg) {
   track->id = id;
   track->file = file;
   track->loop = msg.value("loop", false);
+  track->delay_ms = std::max<gint64>(0, msg.value("delay_ms", static_cast<int64_t>(0)));
   track->in_ms = msg.contains("in_ms") ? msg.value("in_ms", static_cast<gint64>(0))
                                        : file.value("in_ms", static_cast<gint64>(0));
   const json* chans = nullptr;
@@ -2034,6 +2035,19 @@ bool PlayerCore::CheckAudioTrackPreroll(AudioTrack* track) {
       gst_pad_send_event(track->out, seek);
       track->preroll_started = gst_clock_get_time(gst_system_clock_obtain());
       return true;
+    }
+    // 오디오 트랙별 시작 지연: 프리롤 완료 후 delay_ms 대기했다 amix 연결
+    if (track->delay_ms > 0 && !track->delay_timer) {
+      track->delay_timer = g_timeout_add(
+          static_cast<guint>(track->delay_ms),
+          [](gpointer data) -> gboolean {
+            auto* t = static_cast<AudioTrack*>(data);
+            t->delay_timer = 0;
+            if (t->state == AudioTrack::State::Building) t->core->ConnectAudioTrack(t);
+            return G_SOURCE_REMOVE;
+          },
+          track);
+      return false;  // 폴링 종료 — 타이머가 연결 담당
     }
     ConnectAudioTrack(track);
     return false;
@@ -2158,6 +2172,10 @@ void PlayerCore::TeardownAudioTrack(const std::string& track_id) {
   if (track->preroll_watch) {
     g_source_remove(track->preroll_watch);
     track->preroll_watch = 0;
+  }
+  if (track->delay_timer) {
+    g_source_remove(track->delay_timer);
+    track->delay_timer = 0;
   }
   if (track->block) {
     gst_pad_remove_probe(track->out, track->block);
