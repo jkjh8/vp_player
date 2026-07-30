@@ -233,6 +233,8 @@ class PlayerCore {
 
   // 오디오 버스 라우팅
   void DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned);
+  // 오디오 sink 열기 실패 시 무음 fakesink로 교체 — 파이프라인/영상이 멈추지 않게 함.
+  void FallbackAudioSink();
   void ApplyDeckRouting(Deck* deck);
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
@@ -252,6 +254,7 @@ class PlayerCore {
   GstElement* bus_caps_ = nullptr;   // amix 직후 출력 capsfilter (버스 채널수 정책 지점)
   GstElement* audio_tail_ = nullptr; // 출력단 audioresample (sink 교체 시 재연결 지점)
   GstElement* audio_sink_ = nullptr; // wasapi2sink/asiosink (폴백: autoaudiosink)
+  bool audio_fallback_active_ = false;  // sink 열기 실패로 fakesink 대체 중 (디바이스 재선택 시 해제)
   GstPad* silence_pad_ = nullptr;    // 무음 앵커의 amix 요청 패드 (matrix 갱신 지점)
   int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)
   bool bus_positioned_ = true;       // true = fallback mask, false = unpositioned(asio)

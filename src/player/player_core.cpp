@@ -703,8 +703,17 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
       gchar* dbg = nullptr;
       gst_message_parse_error(msg, &err, &dbg);
       std::string src = GST_OBJECT_NAME(GST_MESSAGE_SRC(msg));
-      self->feedback_("error",
-                      "pipeline error from " + src + ": " + (err ? err->message : "unknown"));
+      const std::string emsg = err ? err->message : "unknown";
+      self->feedback_("error", "pipeline error from " + src + ": " + emsg);
+      // 오디오 sink 열기 실패 → 무음 fakesink로 교체해 영상은 계속 재생 (파이프라인 정지 방지)
+      const bool from_asink = src == "asink" || src.rfind("asink", 0) == 0;
+      const bool resource_open =
+          err && (err->domain == GST_RESOURCE_ERROR &&
+                  (err->code == GST_RESOURCE_ERROR_OPEN_WRITE ||
+                   err->code == GST_RESOURCE_ERROR_OPEN_READ_WRITE ||
+                   err->code == GST_RESOURCE_ERROR_BUSY ||
+                   err->code == GST_RESOURCE_ERROR_NOT_FOUND));
+      if (from_asink || resource_open) self->FallbackAudioSink();
       if (err) g_error_free(err);
       g_free(dbg);
       break;
@@ -1779,7 +1788,28 @@ GstPadProbeReturn PlayerCore::OnBusAudioProbe(GstPad*, GstPadProbeInfo* info, gp
   return GST_PAD_PROBE_OK;
 }
 
+// 오디오 sink가 열리지 않을 때(디바이스 사용 불가/점유/포맷 미지원) 무음 fakesink로 교체.
+// 그렇지 않으면 sink가 버퍼를 소비 못 해 amix→덱 오디오 경로가 back-pressure로 막히고,
+// 결국 영상까지 멈춘다("재생되다 멈춤"). fakesink(sync=true)는 클록에 맞춰 소비만 하므로
+// 파이프라인이 계속 흐른다(오디오는 무음). 디바이스 재선택 시 정상 sink로 복귀.
+void PlayerCore::FallbackAudioSink() {
+  if (audio_fallback_active_) return;
+  audio_fallback_active_ = true;
+  gst_element_set_locked_state(audio_sink_, TRUE);
+  gst_element_set_state(audio_sink_, GST_STATE_NULL);
+  gst_element_unlink(audio_tail_, audio_sink_);
+  gst_bin_remove(GST_BIN(pipeline_), audio_sink_);
+
+  audio_sink_ = MakeElement("fakesink", "asink");
+  g_object_set(audio_sink_, "sync", TRUE, "async", FALSE, "silent", TRUE, nullptr);
+  gst_bin_add(GST_BIN(pipeline_), audio_sink_);
+  gst_element_link(audio_tail_, audio_sink_);
+  gst_element_sync_state_with_parent(audio_sink_);
+  feedback_("warn", "audio device could not be opened — running silent (video continues)");
+}
+
 void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned) {
+  audio_fallback_active_ = false;  // 사용자가 디바이스를 다시 고르면 폴백 해제
   gst_element_set_locked_state(audio_sink_, TRUE);
   gst_element_set_state(audio_sink_, GST_STATE_NULL);
   gst_element_unlink(audio_tail_, audio_sink_);
