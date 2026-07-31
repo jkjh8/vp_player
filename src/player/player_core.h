@@ -52,6 +52,12 @@ class PlayerCore {
   PlayerCore();   // Deck/Surface 완전 정의가 필요해 .cpp에서 정의 (unique_ptr pimpl 규칙)
   ~PlayerCore();
 
+  // 하드웨어 가속 사용 여부 (Init 이전에 호출). false면 d3d11 렌더 프로브를 건너뛰고
+  // 소프트웨어 컴포지터/싱크 사용. 디코더 소프트웨어 강제는 main.cpp의 랭크 강등이 담당.
+  void SetHardwareAcceleration(bool on) { hwaccel_enabled_ = on; }
+  bool HwAccelEnabled() const { return hwaccel_enabled_; }  // 요청 값
+  bool UsesD3d11() const { return use_d3d11_; }             // 실효 렌더 경로
+
   // 공유 파이프라인 + 전역 오디오 버스만 구성 (창은 CreateSurface로 별도 생성)
   bool Init(FeedbackFn feedback);
   void Shutdown();
@@ -99,6 +105,14 @@ class PlayerCore {
   void Stop(int window_id = 0);
   void StopAll();  // 전 창 정지 + 오디오 트랙 전부 정지 (stop_all)
   void SeekMs(int64_t time_ms, int window_id = 0);
+
+  // 로컬 멀티윈도우 동기 재생 (배리어). msg={scene_idx?, lead_ms?, timeout_ms?, start_at?,
+  // clips:[{window_id, current, next?, current_time?, next_time?}]}. 전 창 덱을 프리롤/승격(스왑
+  // 보류)해 두고 전원 Prerolled 시 한 번 계산한 start_at으로 동시 스왑. start_at 지정 시(PTP
+  // master) 로컬 계산을 건너뛰고 그 값을 사용 → 멀티 PC 락스텝과 동일 명령으로 통합.
+  void PlaySynced(const nlohmann::json& msg);
+  // 출력 버스 전역 마스터 볼륨 (0~100). 임베디드/오디오트랙 합산 후 최종단에 적용.
+  void SetMasterVolume(double volume);
 
   // 현재 화면/소리를 점유한 덱 id (0/1), 없으면 -1. Stop() 전 player_data 피드백에 실을
   // id 캡처용 (host pStatus와 id 불일치 시 상태 갱신이 무시됨).
@@ -159,6 +173,7 @@ class PlayerCore {
   struct Deck;
   struct AudioTrack;
   struct Surface;  // 창 1개 단위 (comp/vsink/듀얼덱/배경/로고). 정의는 .cpp.
+  struct SyncGroup;  // play_synced 배리어 (정의는 player_internal.h).
 
   // 타임라인 컴파일 결과 (플레인 데이터).
   struct TlClip {
@@ -212,6 +227,15 @@ class PlayerCore {
   void FillPool(Surface* s, int current_idx);   // [current+1 .. current+lookahead] 프리롤
   int CountPrerollDecks() const;                 // 전역 프리롤/빌딩 덱 수 (상한 판정)
   void ClearPool(Surface* s);
+  // 프리롤 상태 구조화 피드백 (UI 로딩 표시용). event: deck_prerolled|playlist_set|cleared.
+  void EmitPreloadStatus(Surface* s, const char* event, int seq_idx, const std::string& path);
+
+  // ---- 동기 그룹 (play_synced 배리어) ----
+  // 풀 승격 또는 신규 빌드하되 스왑은 보류(배리어가 소유). 반환 = 배정된 A/B 슬롯 덱.
+  Deck* PromoteOrBuildHeld(Surface* s, const nlohmann::json& file, int track_idx,
+                           double image_time_s, int64_t delay_ms);
+  void MaybeFireSyncGroup(bool force);  // 전원 Prerolled(또는 force)면 FireSyncGroup
+  void FireSyncGroup(bool force);       // start_at 1회 계산 후 전 멤버 동시 스왑
 
   // ---- 오디오 트랙 ----
   bool CheckAudioTrackPreroll(AudioTrack* track);
@@ -254,6 +278,9 @@ class PlayerCore {
   GstElement* bus_caps_ = nullptr;   // amix 직후 출력 capsfilter (버스 채널수 정책 지점)
   GstElement* audio_tail_ = nullptr; // 출력단 audioresample (sink 교체 시 재연결 지점)
   GstElement* audio_sink_ = nullptr; // wasapi2sink/asiosink (폴백: autoaudiosink)
+  GstElement* master_vol_ = nullptr; // 출력단 전역 마스터 볼륨 (amix 이후 최종 volume)
+  double master_volume_ = 1.0;       // 0~1 (UI 0~100)
+  bool hwaccel_enabled_ = true;      // HW 가속 요청 (Init 전 SetHardwareAcceleration로 설정)
   bool audio_fallback_active_ = false;  // sink 열기 실패로 fakesink 대체 중 (디바이스 재선택 시 해제)
   GstPad* silence_pad_ = nullptr;    // 무음 앵커의 amix 요청 패드 (matrix 갱신 지점)
   int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)
@@ -275,6 +302,8 @@ class PlayerCore {
   int ptp_domain_ = 0;
 
   std::map<int, std::unique_ptr<Surface>> surfaces_;  // window_id → 창
+
+  std::unique_ptr<SyncGroup> sync_group_;  // 대기 중인 play_synced 배리어 (최대 1개)
 
   nlohmann::json tracks_ = nlohmann::json::array();  // set_tracks 사본 (레거시/폴백용)
   bool playlist_mode_ = false;

@@ -205,8 +205,9 @@ bool PlayerCore::Init(FeedbackFn feedback) {
 
   pipeline_ = gst_pipeline_new("vplayer");
 
-  // d3d11 가용성 판정 (첫 comp 생성으로) — 전 창 공통 정책
-  {
+  // d3d11 가용성 판정 (첫 comp 생성으로) — 전 창 공통 정책.
+  // HW 가속을 끈 경우 프로브를 건너뛰고 소프트웨어 렌더 경로로 강제.
+  if (hwaccel_enabled_) {
     GstElement* probe = MakeElement("d3d11compositor", nullptr);
     if (probe) {
       use_d3d11_ = true;
@@ -215,6 +216,9 @@ bool PlayerCore::Init(FeedbackFn feedback) {
       use_d3d11_ = false;
       feedback_("warn", "d3d11compositor unavailable — falling back to software compositor");
     }
+  } else {
+    use_d3d11_ = false;
+    feedback_("info", "hardware acceleration disabled — software render/decode");
   }
 
   amix_ = MakeElement("audiomixer", "amix");
@@ -226,13 +230,17 @@ bool PlayerCore::Init(FeedbackFn feedback) {
   }
   GstElement* aconv = MakeElement("audioconvert", "aconv_out");
   GstElement* ares = MakeElement("audioresample", "ares_out");
-  audio_tail_ = ares;
+  // 전역 마스터 볼륨 (출력 최종단, 전 소스 합산 후). sink 교체와 무관하게 유지되도록 ares 뒤,
+  // sink 앞에 고정. sink 교체는 audio_tail_↔sink를 언링크/재링크하므로 audio_tail_ = master_vol_.
+  master_vol_ = MakeElement("volume", "master_vol");
+  audio_tail_ = master_vol_;
+  if (master_vol_) g_object_set(master_vol_, "volume", master_volume_, nullptr);
   audio_sink_ = MakeElement("wasapi2sink", "asink");
   if (!audio_sink_) {
     audio_sink_ = MakeElement("autoaudiosink", "asink");
     feedback_("warn", "wasapi2sink unavailable — falling back to autoaudiosink");
   }
-  if (!amix_ || !bus_caps_ || !aconv || !ares || !audio_sink_) {
+  if (!amix_ || !bus_caps_ || !aconv || !ares || !master_vol_ || !audio_sink_) {
     feedback_("error", "audio bus elements unavailable");
     return false;
   }
@@ -255,10 +263,10 @@ bool PlayerCore::Init(FeedbackFn feedback) {
   }
   GstElement* silence_conv = MakeElement("audioconvert", "silence_conv");
 
-  gst_bin_add_many(GST_BIN(pipeline_), amix_, bus_caps_, aconv, ares, audio_sink_, silence,
-                   silence_conv, silence_caps, nullptr);
+  gst_bin_add_many(GST_BIN(pipeline_), amix_, bus_caps_, aconv, ares, master_vol_, audio_sink_,
+                   silence, silence_conv, silence_caps, nullptr);
 
-  if (!gst_element_link_many(amix_, bus_caps_, aconv, ares, audio_sink_, nullptr)) {
+  if (!gst_element_link_many(amix_, bus_caps_, aconv, ares, master_vol_, audio_sink_, nullptr)) {
     feedback_("error", "failed to link audio output stage");
     return false;
   }
@@ -501,6 +509,11 @@ json PlayerCore::EngineStats() const {
               {"audio_tracks", static_cast<int>(audio_tracks_.size())}};
 }
 
+void PlayerCore::SetMasterVolume(double volume) {
+  master_volume_ = std::clamp(volume, 0.0, 100.0) / 100.0;
+  if (master_vol_) g_object_set(master_vol_, "volume", master_volume_, nullptr);
+}
+
 void PlayerCore::ApplyDisplayPlacement(const WindowPlacement& placement, int window_id) {
   if (Surface* s = GetSurface(window_id)) s->window.ApplyPlacement(placement);
 }
@@ -648,6 +661,11 @@ void PlayerCore::SetLogoEnabled(bool show, int window_id) {
 
 void PlayerCore::Shutdown() {
   if (!pipeline_) return;
+  // 대기 중인 동기 그룹의 타임아웃 소스 제거 (해체 후 콜백이 죽은 덱을 참조하지 않도록).
+  if (sync_group_) {
+    if (sync_group_->timeout_id) g_source_remove(sync_group_->timeout_id);
+    sync_group_.reset();
+  }
   for (auto& [id, t] : audio_tracks_) {
     if (t && t->preroll_watch) g_source_remove(t->preroll_watch);
   }
@@ -947,8 +965,10 @@ PlayerCore::Deck* PlayerCore::BuildDeck(Surface* s, int deck_id, const json& fil
 }
 
 // 프리롤 완료 후 실제 표시: 트랙별 delay_ms만큼 대기했다 스왑(그동안 배경색 유지).
+// start_at 지정 시엔 delay_ms를 무시하고 즉시 링크한다 — 표시 시각은 pad offset(start_at)이
+// 결정하므로, delay 타이머로 링크를 늦추면 오프셋이 과거로 밀릴 수 있다(동기 우선).
 void PlayerCore::SwapWithDelay(Deck* deck) {
-  if (deck->delay_ms > 0) {
+  if (deck->start_at_rt < 0 && deck->delay_ms > 0) {
     deck->delay_timer = g_timeout_add(
         static_cast<guint>(deck->delay_ms),
         [](gpointer data) -> gboolean {
@@ -993,12 +1013,14 @@ bool PlayerCore::CheckPreroll(Deck* deck) {
       return true;
     }
     deck->state = Deck::State::Prerolled;
-    if (deck->play_when_ready) {
+    if (deck->sync_pending) {
+      // 동기 그룹 멤버: 개별 스왑 금지 — 배리어가 전원 준비 시 일괄 스왑을 소유.
+      MaybeFireSyncGroup(/*force=*/false);
+    } else if (deck->play_when_ready) {
       SwapWithDelay(deck);  // 트랙별 delay_ms 반영
     } else if (deck->id < 0) {
-      // 풀 파킹 덱: 승격 전까지 대기 (standby 슬롯 미점유)
-      feedback_("debug", "pool deck prerolled (win " + std::to_string(s->id) + ", track " +
-                             std::to_string(deck->track_idx) + ")");
+      // 풀 파킹 덱: 승격 전까지 대기 (standby 슬롯 미점유). UI 로딩 표시용 구조화 피드백.
+      EmitPreloadStatus(s, "deck_prerolled", deck->track_idx, deck->file.value("path", std::string()));
     } else {
       s->standby_deck = deck->id;
       feedback_("debug", "deck " + std::to_string(deck->id) + " preloaded (win " +
@@ -1136,25 +1158,57 @@ void PlayerCore::SwapTo(Deck* deck) {
   deck->state = Deck::State::Live;
   s->paused = false;
 
-  // 이전 라이브 덱: 즉시 숨김(하드 컷) 후 지연 해체
+  // 이전 라이브 덱: start_at이 미래면 그 시각까지 유지(장면 전환 시 검정 갭 방지), 그 순간
+  // 숨김+해체. 들어오는 덱을 위로 올려두면 start_at에 첫 프레임이 뜨는 즉시 old를 덮는다
+  // (크로스오버 무결). start_at이 현재/과거면 기존 즉시 하드컷.
+  struct SwapCtx {
+    PlayerCore* self;
+    Surface* surf;
+    int old_id;
+    int new_id;
+  };
   if (s->live_deck >= 0 && s->live_deck != deck->id && s->decks[s->live_deck]) {
     Deck* old = s->decks[s->live_deck].get();
-    if (old->comp_pad) g_object_set(old->comp_pad, "alpha", 0.0, nullptr);
-    if (old->amix_pad) g_object_set(old->amix_pad, "mute", TRUE, nullptr);
-    struct SwapCtx {
-      PlayerCore* self;
-      Surface* surf;
-      int old_id;
-    };
-    g_timeout_add(100, [](gpointer data) -> gboolean {
-      auto* c = static_cast<SwapCtx*>(data);
-      Surface* sf = c->surf;
-      if (sf->decks[c->old_id] && sf->live_deck != c->old_id) {
-        c->self->TeardownDeck(sf->decks[c->old_id].get());
-      }
-      delete c;
-      return G_SOURCE_REMOVE;
-    }, new SwapCtx{this, s, old->id});
+    const gint64 now_rt = static_cast<gint64>(RunningTime());
+    const gint64 hide_at = static_cast<gint64>(offset);  // 이번 스왑의 pad offset(= start_at)
+    const gint64 wait_ms = (hide_at > now_rt) ? (hide_at - now_rt) / GST_MSECOND : 0;
+    auto* ctx = new SwapCtx{this, s, old->id, deck->id};
+    if (wait_ms > 0) {
+      if (deck->comp_pad) g_object_set(deck->comp_pad, "zorder", (guint)90, nullptr);
+      g_timeout_add(
+          static_cast<guint>(wait_ms + 20),  // +~1프레임 여유
+          [](gpointer data) -> gboolean {
+            auto* c = static_cast<SwapCtx*>(data);
+            Surface* sf = c->surf;
+            if (sf->decks[c->old_id] && sf->live_deck != c->old_id) {
+              Deck* o = sf->decks[c->old_id].get();
+              if (o->comp_pad) g_object_set(o->comp_pad, "alpha", 0.0, nullptr);
+              if (o->amix_pad) g_object_set(o->amix_pad, "mute", TRUE, nullptr);
+              c->self->TeardownDeck(o);
+            }
+            // 남은(현재 라이브) 덱 zorder를 기본으로 복귀 → 다음 전환에서 새 덱이 다시 위로.
+            if (sf->decks[c->new_id] && sf->decks[c->new_id]->comp_pad)
+              g_object_set(sf->decks[c->new_id]->comp_pad, "zorder", (guint)(1 + c->new_id),
+                           nullptr);
+            delete c;
+            return G_SOURCE_REMOVE;
+          },
+          ctx);
+    } else {
+      if (old->comp_pad) g_object_set(old->comp_pad, "alpha", 0.0, nullptr);
+      if (old->amix_pad) g_object_set(old->amix_pad, "mute", TRUE, nullptr);
+      g_timeout_add(
+          100,
+          [](gpointer data) -> gboolean {
+            auto* c = static_cast<SwapCtx*>(data);
+            Surface* sf = c->surf;
+            if (sf->decks[c->old_id] && sf->live_deck != c->old_id)
+              c->self->TeardownDeck(sf->decks[c->old_id].get());
+            delete c;
+            return G_SOURCE_REMOVE;
+          },
+          ctx);
+    }
   }
 
   s->live_deck = deck->id;
@@ -1205,6 +1259,11 @@ void PlayerCore::SwapTo(Deck* deck) {
 void PlayerCore::TeardownDeck(Deck* deck) {
   Surface* s = deck->surface;
   const int id = deck->id;
+  // 대기 중인 동기 그룹에서 제거 (배리어가 죽은 포인터를 참조하지 않도록).
+  if (sync_group_) {
+    auto& m = sync_group_->members;
+    m.erase(std::remove(m.begin(), m.end(), deck), m.end());
+  }
   if (deck->preroll_watch) {
     g_source_remove(deck->preroll_watch);
     deck->preroll_watch = 0;
@@ -1288,6 +1347,25 @@ void PlayerCore::ClearPool(Surface* s) {
     if (d) TeardownDeck(d.get());
   }
   s->pool.clear();
+  EmitPreloadStatus(s, "cleared", -1, std::string());  // 호스트 배지 리셋 (expected/prerolled=0)
+}
+
+// 프리롤 상태 구조화 피드백 (UI "로딩됨/로딩중" 표시). prerolled = 풀에서 Prerolled 상태 덱 수,
+// expected = 현재 풀 크기. 모두 GLib 메인루프 스레드에서 호출 → feedback_ 직접 호출 안전.
+void PlayerCore::EmitPreloadStatus(Surface* s, const char* event, int seq_idx,
+                                   const std::string& path) {
+  if (!s) return;
+  int prerolled = 0;
+  for (const auto& d : s->pool)
+    if (d && d->state == Deck::State::Prerolled) ++prerolled;
+  feedback_("preload_status",
+            json{{"window_id", s->id},
+                 {"event", event},
+                 {"seq_idx", seq_idx},
+                 {"path", path},
+                 {"prerolled", prerolled},
+                 {"expected", static_cast<int>(s->pool.size())},
+                 {"sequence_len", static_cast<int>(s->sequence.size())}});
 }
 
 // 시퀀스의 한 인덱스를 풀에 프리롤 (이미 라이브/스탠바이/풀에 있으면 skip, 상한 초과면 false).
@@ -1341,6 +1419,105 @@ void PlayerCore::PromotePooled(Surface* s, int pool_idx, bool swap_now) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 동기 그룹 (play_synced 배리어)
+// ---------------------------------------------------------------------------
+
+// 풀 승격 또는 신규 빌드하되 스왑은 보류. 반환 = 슬롯에 배정된 덱(없으면 nullptr).
+PlayerCore::Deck* PlayerCore::PromoteOrBuildHeld(Surface* s, const json& file, int track_idx,
+                                                 double image_time_s, int64_t delay_ms) {
+  const int slot = (s->live_deck == 0) ? 1 : 0;
+  const int pidx = PoolFindByPath(s, file.value("path", ""));
+  if (pidx >= 0) {
+    Deck* pd = s->pool[pidx].get();
+    pd->image_time_ms = static_cast<gint64>(image_time_s * 1000.0);
+    pd->delay_ms = std::max<gint64>(0, delay_ms);
+    pd->track_idx = track_idx;
+    PromotePooled(s, pidx, /*swap_now=*/false);  // 슬롯에 파킹(스왑 보류)
+    return s->decks[slot].get();
+  }
+  if (s->standby_deck >= 0 && s->decks[s->standby_deck]) TeardownDeck(s->decks[s->standby_deck].get());
+  return BuildDeck(s, slot, file, track_idx, /*play_when_ready=*/false, image_time_s, delay_ms);
+}
+
+void PlayerCore::MaybeFireSyncGroup(bool force) {
+  if (!sync_group_) return;
+  if (!force) {
+    for (Deck* d : sync_group_->members)
+      if (d && d->state == Deck::State::Building) return;  // 아직 프리롤 중인 멤버 존재
+  }
+  FireSyncGroup(force);
+}
+
+void PlayerCore::FireSyncGroup(bool force) {
+  if (!sync_group_) return;
+  auto g = std::move(sync_group_);  // 먼저 detach (SwapTo/FillPool 재진입 방지)
+  if (g->timeout_id) g_source_remove(g->timeout_id);
+  // start_at을 딱 한 번 계산 → 전 멤버가 동일 오프셋 → 동시 표시(락스텝).
+  const gint64 start_at = (g->explicit_start_at >= 0)
+                              ? g->explicit_start_at
+                              : static_cast<gint64>(RunningTime()) + g->lead_ns;
+  for (Deck* d : g->members) {
+    if (!d) continue;
+    d->sync_pending = false;
+    if (d->state == Deck::State::Prerolled) {
+      d->start_at_rt = start_at;
+      SwapTo(d);
+    } else {
+      // force(타임아웃) 경로에서 아직 Building → 동기 포기, 준비되면 자체 러닝타임으로 스왑
+      d->start_at_rt = -1;
+      d->play_when_ready = true;
+    }
+  }
+  (void)force;
+}
+
+void PlayerCore::PlaySynced(const json& msg) {
+  if (sync_group_) FireSyncGroup(/*force=*/true);  // 이전 대기 그룹 강제 발화(정리)
+  // 이 시점 sync_group_ == null → 아래 PromoteOrBuildHeld 안에서 TeardownDeck이 불려도
+  // 죽은 그룹 참조 없음. 멤버는 로컬 g에 축적한 뒤 마지막에 sync_group_로 대입한다.
+
+  auto g = std::make_unique<SyncGroup>();
+  g->scene_idx = msg.value("scene_idx", -1);
+  g->lead_ns = std::max<int64_t>(0, msg.value("lead_ms", 120)) * GST_MSECOND;
+  g->explicit_start_at = msg.value("start_at", static_cast<int64_t>(-1));
+  const int timeout_ms = std::clamp(msg.value("timeout_ms", 1500), 100, 10000);
+
+  if (msg.contains("clips") && msg["clips"].is_array()) {
+    for (const auto& c : msg["clips"]) {
+      const int wid = c.value("window_id", 0);
+      Surface* s = GetSurface(wid);
+      if (!s || !c.contains("current") || c["current"].is_null()) continue;
+      const int track_idx = c.value("track_idx", g->scene_idx);
+      const double t = c.value("current_time", c["current"].value("time", 0.0));
+      const int64_t delay_ms = c["current"].value("delay_ms", static_cast<int64_t>(0));
+      Deck* d = PromoteOrBuildHeld(s, c["current"], track_idx, t, delay_ms);
+      if (d) {
+        d->sync_pending = true;
+        g->members.push_back(d);
+      }
+      if (c.contains("next") && !c["next"].is_null()) {
+        const double nt = c.value("next_time", c["next"].value("time", 0.0));
+        PreloadNext(c["next"], track_idx >= 0 ? track_idx + 1 : -1, nt, d ? d->id : -1, wid);
+      }
+    }
+  }
+
+  sync_group_ = std::move(g);
+  MaybeFireSyncGroup(/*force=*/false);  // 이미 프리롤된 멤버만 있으면 즉시 발화
+  if (sync_group_) {                     // 아직 대기 → 타임아웃 무장 (Building 멤버 커버)
+    sync_group_->timeout_id = g_timeout_add(
+        static_cast<guint>(timeout_ms),
+        [](gpointer self) -> gboolean {
+          auto* core = static_cast<PlayerCore*>(self);
+          if (core->sync_group_) core->sync_group_->timeout_id = 0;  // 자기 자신 → 중복 remove 방지
+          core->MaybeFireSyncGroup(/*force=*/true);
+          return G_SOURCE_REMOVE;
+        },
+        this);
+  }
+}
+
 void PlayerCore::SetPreloadConfig(const json& msg) {
   if (msg.contains("lookahead"))
     preload_lookahead_ = std::clamp(msg.value("lookahead", 1), 0, 32);
@@ -1372,6 +1549,8 @@ void PlayerCore::PreloadPlaylist(const json& msg) {
   feedback_("debug", "preload_playlist: win " + std::to_string(window_id) + ", " +
                          std::to_string(s->sequence.size()) + " tracks, pool " +
                          std::to_string(s->pool.size()));
+  // 호스트가 expected(풀 크기)를 미리 알도록 통지 (대부분 아직 Building → prerolled=0에서 시작).
+  EmitPreloadStatus(s, "playlist_set", start, std::string());
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1570,9 @@ int PlayerCore::PlayFile(const json& file, int track_idx, double image_time_s, i
     pd->image_time_ms = static_cast<gint64>(image_time_s * 1000.0);
     pd->delay_ms = std::max<gint64>(0, file.value("delay_ms", static_cast<int64_t>(0)));
     pd->track_idx = track_idx;
+    // 풀 승격 시에도 이번 재생의 start_at을 반드시 전파 (기본 -1 = 로컬 RunningTime 폴백).
+    // 이게 빠지면 프리로드된 트랙이 동기 시작을 잃는다.
+    pd->start_at_rt = file.value("start_at", static_cast<int64_t>(-1));
     const int slot = (s->live_deck == 0) ? 1 : 0;
     PromotePooled(s, pidx, /*swap_now=*/true);
     return slot;

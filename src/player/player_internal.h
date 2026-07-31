@@ -80,6 +80,10 @@ struct PlayerCore::Deck {
   // 같은 시각에 첫 프레임을 표시(락스텝). file.start_at.
   gint64 start_at_rt = -1;
 
+  // 로컬 멀티윈도우 동기(play_synced 배리어): 이 덱이 대기 중인 동기 그룹의 멤버.
+  // true면 프리롤 완료 시 개별 스왑을 하지 않고 배리어(FireSyncGroup)가 일괄 스왑을 소유.
+  bool sync_pending = false;
+
   bool is_image = false;
   gint64 image_time_ms = 0;
   guint image_timer = 0;
@@ -163,6 +167,19 @@ struct PlayerCore::Surface {
   bool logo_enabled = true;
   bool media_wants_logo = true;
   bool logo_loaded = false;
+};
+
+// ---------------------------------------------------------------------------
+// SyncGroup — play_synced 배리어. 여러 창의 덱을 모아 전원이 Prerolled 될 때까지
+// 기다렸다가, 공유 러닝타임 기준 start_at을 한 번 계산해 동시에 스왑한다(락스텝).
+// 동시에 하나만 대기(새 play_synced가 오면 기존 그룹을 강제 발화).
+// ---------------------------------------------------------------------------
+struct PlayerCore::SyncGroup {
+  int scene_idx = -1;
+  gint64 lead_ns = 120 * GST_MSECOND;   // 프리롤 완료 후 스왑/링크 여유
+  gint64 explicit_start_at = -1;        // >=0 = 외부(PTP master) 지정값 사용, 로컬 계산 생략
+  guint timeout_id = 0;                 // 타임아웃 폴백 소스
+  std::vector<Deck*> members;           // 함께 스왑할 덱들 (소유는 Surface A/B 슬롯)
 };
 
 }  // namespace vp

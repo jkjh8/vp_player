@@ -12,7 +12,9 @@
 #include <gst/gst.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 
@@ -129,6 +131,9 @@ void HandleCommand(const json& msg) {
       const double t = msg.value("next_time", msg["next"].value("time", 0.0));
       core.PreloadNext(msg["next"], msg.value("next_track_idx", -1), t, -1, wid);
     }
+  } else if (cmd == "play_synced") {
+    // 로컬 멀티윈도우 동기 재생 — 창별 클립을 모아 배리어로 동시 스왑 (window_id는 clips[]가 소유)
+    core.PlaySynced(msg);
   } else if (cmd == "next") {
     core.Next(wid);
   } else if (cmd == "previous") {
@@ -205,6 +210,9 @@ void HandleCommand(const json& msg) {
     core.SetAudioDevice(msg.value("device_id", ""));
   } else if (cmd == "set_channel_delays") {
     core.SetChannelDelays(msg.value("delays", json::array()));
+  } else if (cmd == "set_master_volume") {
+    core.SetMasterVolume(msg.value("volume", 100.0));
+    SendFeedback("set_master_volume", json{{"volume", msg.value("volume", 100.0)}});
   } else if (cmd == "set_deck_audio") {
     // 활성 덱(임베디드 오디오) 라이브 라우팅/볼륨/뮤트
     core.SetDeckAudio(msg, wid);
@@ -325,8 +333,55 @@ gboolean SendReady(gpointer) {
                json{{"features",
                      json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
                                   "display", "timeline", "multi_window", "track_delay",
-                                  "memory_status", "ptp_sync", "channel_delay"})}});
+                                  "memory_status", "ptp_sync", "channel_delay", "play_synced",
+                                  "preload_status", "hwaccel", "master_volume"})}});
+  // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음)
+  SendFeedback("hwaccel_status",
+               json{{"enabled", g_app->core.HwAccelEnabled()},
+                    {"render", g_app->core.UsesD3d11() ? "d3d11" : "software"},
+                    {"decode", g_app->core.HwAccelEnabled() ? "hardware" : "software"}});
   return G_SOURCE_REMOVE;
+}
+
+// ---------- 하드웨어 가속 토글 ----------
+
+// env VP_HWACCEL: 부재/"1"/"true"/"on"/"auto" = ON(기본), "0"/"false"/"no"/"off" = OFF.
+bool HwAccelEnabledFromEnv() {
+  const char* v = getenv("VP_HWACCEL");
+  if (!v || !*v) return true;
+  std::string s(v);
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+  return !(s == "0" || s == "false" || s == "no" || s == "off");
+}
+
+// HW 디코더 팩토리를 GST_RANK_NONE으로 강등 → uridecodebin3가 소프트웨어(avdec_*)를 선택.
+// gst_init 이후(레지스트리 준비) + 첫 파이프라인 빌드 이전에 1회 호출.
+void ForceSoftwareDecoders() {
+  GstRegistry* reg = gst_registry_get();
+  GList* feats = gst_registry_feature_filter(
+      reg,
+      [](GstPluginFeature* f, gpointer) -> gboolean {
+        if (!GST_IS_ELEMENT_FACTORY(f)) return FALSE;
+        auto* fac = GST_ELEMENT_FACTORY(f);
+        if (!gst_element_factory_list_is_type(fac, GST_ELEMENT_FACTORY_TYPE_DECODER)) return FALSE;
+        const gchar* klass = gst_element_factory_get_metadata(fac, GST_ELEMENT_METADATA_KLASS);
+        return (klass && strstr(klass, "Hardware")) ? TRUE : FALSE;
+      },
+      FALSE, nullptr);
+  for (GList* l = feats; l; l = l->next)
+    gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(l->data), GST_RANK_NONE);
+  gst_plugin_feature_list_free(feats);
+
+  // klass에 "Hardware"를 안 실은 팩토리 안전망 (이름 기반).
+  static const char* kNames[] = {"d3d11h264dec", "d3d11h265dec", "d3d11vp8dec",  "d3d11vp9dec",
+                                 "d3d11av1dec",  "d3d11mpeg2dec", "mfh264dec",   "mfh265dec",
+                                 "mfvp9dec"};
+  for (const char* n : kNames) {
+    if (GstPluginFeature* f = gst_registry_lookup_feature(reg, n)) {
+      gst_plugin_feature_set_rank(f, GST_RANK_NONE);
+      gst_object_unref(f);
+    }
+  }
 }
 
 // ---------- 번들 GStreamer 격리 (배포 시) ----------
@@ -357,9 +412,15 @@ int main(int argc, char* argv[]) {
   ConfigureBundledGStreamer();
   gst_init(&argc, &argv);
 
+  // 하드웨어 가속 토글 (기동 시에만 반영 — 호스트가 VP_HWACCEL env로 전달, 변경 시 재시작).
+  const bool hwaccel = HwAccelEnabledFromEnv();
+  if (!hwaccel) ForceSoftwareDecoders();  // gst_init 이후 + 첫 파이프라인 전 (디코더 SW 강제)
+
   App app;
   g_app = &app;
   app.loop = g_main_loop_new(nullptr, FALSE);
+
+  app.core.SetHardwareAcceleration(hwaccel);  // Init의 d3d11 렌더 프로브 게이트 (반드시 Init 전)
 
   // 공유 파이프라인 + 전역 오디오 버스 구성. 창은 호스트가 create_window로 필요할 때 생성
   // (자동 주 창 없음 — 사용자가 설정한 창만 열린다).
