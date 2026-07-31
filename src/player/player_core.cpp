@@ -361,6 +361,20 @@ bool PlayerCore::BuildSurfaceGraph(Surface* s) {
     feedback_("error", "surface: video output elements unavailable");
     return false;
   }
+  // 배경을 검정으로 (기본값은 체커보드 무늬 — 배경이 순간 비면 그게 보임). d3d11compositor/
+  // compositor 모두 background enum 1 = black.
+  if (g_object_class_find_property(G_OBJECT_GET_CLASS(s->comp), "background"))
+    g_object_set(s->comp, "background", 1, nullptr);
+  // 핵심: 실행 중(러닝타임 T>0)인 파이프라인에 컴포지터를 나중에 추가하므로, 애그리게이터가
+  // 러닝타임 0부터 출력하면(기본 start-time-selection=zero) 클록(T)보다 과거라 전 프레임이
+  // 버려지거나 정지한다. start-time-selection=1(first)로 첫 버퍼의 러닝타임(≈T)에서 시작해 정렬.
+  if (g_object_class_find_property(G_OBJECT_GET_CLASS(s->comp), "start-time-selection"))
+    g_object_set(s->comp, "start-time-selection", 1, nullptr);
+  // 싱크가 '늦은' 프레임을 버리지 않게: QoS off + max-lateness=-1 (무제한). 실행 중 파이프라인에
+  // 창을 나중에 추가하면 새 라이브 브랜치의 지연 계산이 어긋나 모든 프레임이 '너무 늦음'으로
+  // 버려져 첫 프레임에서 정지하던 문제 방지.
+  g_object_set(s->vsink, "qos", FALSE, "sync", TRUE, "max-lateness", (gint64)-1, "async", FALSE,
+               nullptr);
 
   s->bg_src = MakeElementN("videotestsrc", "bg" + sfx);
   g_object_set(s->bg_src, "pattern", 17 /* solid-color */, "is-live", TRUE, "foreground-color",
@@ -406,6 +420,9 @@ bool PlayerCore::BuildSurfaceGraph(Surface* s) {
   gst_element_sync_state_with_parent(s->bg_src);
   gst_element_sync_state_with_parent(bg_caps);
   if (bg_upload) gst_element_sync_state_with_parent(bg_upload);
+  // 실행 중 파이프라인에 라이브 브랜치(bg/컴포지터/싱크)를 추가했으니 지연 재계산 —
+  // 안 하면 새 싱크가 stale 지연으로 프레임을 늦다고 버린다.
+  gst_bin_recalculate_latency(GST_BIN(pipeline_));
   return true;
 }
 
@@ -722,7 +739,9 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
       GError* err = nullptr;
       gchar* dbg = nullptr;
       gst_message_parse_warning(msg, &err, &dbg);
-      self->feedback_("warn", std::string(err ? err->message : "pipeline warning"));
+      std::string wsrc = GST_OBJECT_NAME(GST_MESSAGE_SRC(msg));
+      self->feedback_("warn", "[" + wsrc + "] " + std::string(err ? err->message : "warning") +
+                                  (dbg ? std::string(" | ") + dbg : ""));
       if (err) g_error_free(err);
       g_free(dbg);
       break;
