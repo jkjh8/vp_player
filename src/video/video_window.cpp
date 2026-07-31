@@ -143,6 +143,7 @@ void VideoWindow::ThreadMain(WindowPlacement placement, HANDLE ready_event) {
   wc.hInstance = GetModuleHandleW(nullptr);
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.hbrBackground = nullptr;  // WM_ERASEBKGND에서 직접 칠함
+  wc.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));  // 앱 아이콘(app.rc)
   wc.lpszClassName = kClassName;
   RegisterClassExW(&wc);
 

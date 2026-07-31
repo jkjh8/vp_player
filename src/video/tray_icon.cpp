@@ -51,7 +51,9 @@ void TrayIcon::ThreadMain(std::wstring tooltip, HANDLE ready_event) {
   nid.uID = kTrayId;
   nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   nid.uCallbackMessage = WM_APP_TRAY;
-  nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  // 임베디드 앱 아이콘(app.rc, ID 101). 없으면 일반 아이콘으로 폴백.
+  nid.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101));
+  if (!nid.hIcon) nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
   wcsncpy_s(nid.szTip, tooltip.c_str(), _TRUNCATE);
   Shell_NotifyIconW(NIM_ADD, &nid);
 

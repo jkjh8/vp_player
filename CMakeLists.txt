@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(vplayer VERSION 0.5.4 LANGUAGES CXX)
+project(vplayer VERSION 0.5.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,6 +68,7 @@ add_executable(vplayer
   src/video/display_enum.cpp
   src/media/probe.cpp
   src/app.manifest
+  src/app.rc
 )
 
 target_include_directories(vplayer PRIVATE src "${stb_SOURCE_DIR}")

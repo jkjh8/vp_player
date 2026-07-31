@@ -370,11 +370,10 @@ bool PlayerCore::BuildSurfaceGraph(Surface* s) {
   // 버려지거나 정지한다. start-time-selection=1(first)로 첫 버퍼의 러닝타임(≈T)에서 시작해 정렬.
   if (g_object_class_find_property(G_OBJECT_GET_CLASS(s->comp), "start-time-selection"))
     g_object_set(s->comp, "start-time-selection", 1, nullptr);
-  // 싱크가 '늦은' 프레임을 버리지 않게: QoS off + max-lateness=-1 (무제한). 실행 중 파이프라인에
-  // 창을 나중에 추가하면 새 라이브 브랜치의 지연 계산이 어긋나 모든 프레임이 '너무 늦음'으로
-  // 버려져 첫 프레임에서 정지하던 문제 방지.
-  g_object_set(s->vsink, "qos", FALSE, "sync", TRUE, "max-lateness", (gint64)-1, "async", FALSE,
-               nullptr);
+  // async=FALSE: 실행 중 파이프라인에 창을 나중에 추가할 때 프리롤 핸드셰이크 대기로 멈추는 것 방지(핵심).
+  // QoS는 켜둔다: 디코드가 밀리면 늦은 프레임을 드롭해 실시간을 유지(버벅임 완화). max-lateness는
+  // 기본값 사용 — 과거 정지 버그는 타이밍 정렬(async + start-time-selection)로 해결됐다.
+  g_object_set(s->vsink, "qos", TRUE, "sync", TRUE, "async", FALSE, nullptr);
 
   s->bg_src = MakeElementN("videotestsrc", "bg" + sfx);
   g_object_set(s->bg_src, "pattern", 17 /* solid-color */, "is-live", TRUE, "foreground-color",
