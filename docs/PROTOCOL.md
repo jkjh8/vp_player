@@ -960,3 +960,115 @@ P→H {"type":"memory_status","data":{
   "sys_total_bytes": 34293301248, "sys_avail_bytes": 12000000000, "sys_load_percent": 65
 }}
 ```
+
+---
+
+# §7 추가 명령 (v3 — 문서 보강)
+
+아래는 코드(호스트↔플레이어)엔 이미 구현돼 있으나 위 문서에 빠져 있던 명령/피드백이다. 원칙은
+동일하다: 새 command/feedback type 추가로만 확장하며, 구버전은 모르는 것을 무시한다.
+
+## 7.1 동기 배치 재생 `play_synced` (락스텝 스왑)
+
+여러 창의 클립을 **동시에(락스텝)** 시작하기 위한 배리어 재생. 창별 `play_current_and_load_next`를
+따로 보내면 각 창이 프리롤 완료 시점에 개별 스왑돼 프레임이 어긋나는데, 이를 없앤다.
+
+```json
+{
+  "command": "play_synced",
+  "scene_idx": 0,
+  "lead_ms": 150,
+  "timeout_ms": 1500,
+  "start_at": -1,
+  "clips": [
+    { "window_id": 1, "track_idx": 0,
+      "current": { "...file 객체...", "delay_ms?": 0 },
+      "next":    { "...file 객체..." } | null,
+      "current_time": 5, "next_time": 10 }
+  ]
+}
+```
+
+- 각 클립을 해당 창 덱에 **스왑 보류 상태로 프리롤**(승격/빌드하되 화면 스왑은 지연)한다.
+- 모든 클립이 Prerolled가 되면(또는 `timeout_ms` 경과 시) **한 번** `RunningTime()+lead_ms`(또는
+  `start_at`이 `>=0`이면 그 절대 러닝타임)로 **전 창을 동시 스왑**한다. 클록 왕복 불요.
+- `start_at`(int64 ns, 옵션): 멀티 PC PTP master가 계산한 공유 러닝타임. 있으면 로컬 계산을 건너뛴다.
+- `scene_idx`/`track_idx`: `end_reached`에 실릴 인덱스. 동시에 하나의 sync group만 유효(새 `play_synced`가
+  오면 이전 그룹을 즉시 발화).
+- 미지원 플레이어(capabilities에 `play_synced` 없음)면 호스트가 창별 `play_current_and_load_next`로 폴백.
+
+## 7.2 전역 마스터 볼륨 `set_master_volume`
+
+```json
+{"command":"set_master_volume","volume":100}
+```
+- `volume`: 0–100. 출력 버스 최종단(amix→bus_caps→aconv→ares→**master_vol**→sink)의 게인. 임베디드+
+  독립 오디오 트랙 전부에 공통 적용. capabilities `master_volume` 있을 때만 전송된다.
+- 플레이어가 echo 피드백(`set_master_volume`)을 보낼 수 있으나 호스트는 소비하지 않는다(무해).
+
+## 7.3 출력 채널별 지연 `set_channel_delays` (DSP)
+
+```json
+{"command":"set_channel_delays","delays":[0,0,20,20]}
+```
+- `delays`: 출력(버스) 채널별 지연(ms) 배열. 인덱스=출력 채널. 믹서 출력(Nch 인터리브) 버퍼 프로브에
+  채널별 링버퍼 지연 라인으로 적용(토폴로지 무변경, 임베디드+오디오트랙 공통). 빈 배열=해제.
+- 디바이스 채널수 변경 시 지연 링을 재구성. capabilities `channel_delay` 있을 때만 전송.
+- (주의: §6.3의 file별 `delay_ms`는 "표시 지연"으로 이것과 별개다.)
+
+## 7.4 디스플레이 조회/배치 `get_displays` / `set_display`
+
+```json
+{"command":"get_displays"}
+{"command":"set_display","window_id":1,"monitor_index":-1,"x":0,"y":0,"width":0,"height":0,"aspect_mode":"letterbox"}
+```
+- `get_displays` → `P→H {"type":"displays","data":{"displays":[{index,primary,x,y,width,height,...}]}}`.
+- `set_display`(창별, §6.2 `window_id` 기본 0): 대상 창을 모니터/좌표/크기/비율로 재배치. `width/height=0`
+  = 모니터 전체. 처리 후 `P→H {"type":"set_display","data":{...적용값...}}` echo(호스트가 영속).
+- `aspect_mode`: `"letterbox"|"crop"|"stretch"`.
+
+## 7.5 멀티 PC PTP 동기 `enable_ptp` / `ptp_base_time` / `get_running_time`
+
+IEEE 1588 PTP 클록으로 여러 PC의 러닝타임을 맞춘다(락스텝 재생의 기준).
+
+```json
+{"command":"enable_ptp","domain":0}
+{"command":"ptp_base_time","base_time":123456789012}
+{"command":"get_running_time"}
+```
+- `enable_ptp {domain}`: `gst_ptp_init`(1회) + PTP 클록 생성 + sync 대기 후 파이프라인 클록으로 사용,
+  synced 시 base_time을 현재 PTP 시각으로 리셋. → `P→H {"type":"ptp_status","data":{enabled,synced,base_time,running_time}}`.
+- `ptp_base_time {base_time}`(int64 ns): slave가 master의 base_time을 적용.
+- `get_running_time`: 현재 러닝타임 조회 → `P→H {"type":"running_time","data":{running_time,base_time,...}}`.
+- capabilities `ptp_sync` 있을 때만 전송.
+
+## 7.6 하드웨어 가속 상태 `hwaccel_status` (피드백)
+
+기동 인자/환경(`VP_HWACCEL`=0이면 소프트웨어 강제)으로 결정되며, 명령은 없고 상태만 보고한다.
+
+```json
+P→H {"type":"hwaccel_status","data":{"enabled":true,"render":"d3d11","decode":"d3d11"}}
+```
+- `render`/`decode`가 모두 `"software"`면 호스트가 "소프트웨어(폴백)"로 표시(요청 on이어도 d3d11 프로브
+  실패 시 발생 가능). capabilities `hwaccel`.
+
+## 7.7 프리롤 진척 `preload_status` (피드백)
+
+전 트랙 프리롤(§6.4) 진척을 창별로 보고(로딩 배지용).
+
+```json
+P→H {"type":"preload_status","data":{"window_id":1,"event":"progress|cleared","expected":5,"prerolled":3,"seq_idx?":2,"path?":"..."}}
+```
+- 호스트가 창별 `{expected,prerolled}`를 집계해 "로딩중/로딩됨"을 판정. `event:"cleared"`=그 창 프리롤
+  상태 리셋. capabilities `preload_status`.
+
+## 7.8 capabilities.features (현행 전체)
+
+ready 직후 `capabilities` 피드백의 `features` 현행 목록(플레이어 빌드에 따라 가감):
+
+```
+channel_map, audio_track, live_routing, embedded_streams, display,
+timeline, multi_window, track_delay, memory_status, ptp_sync,
+channel_delay, play_synced, preload_status, hwaccel, master_volume
+```
+호스트는 이 목록에 있는 기능만 해당 명령을 전송한다(구버전 = 목록에 없음 = 강하).
