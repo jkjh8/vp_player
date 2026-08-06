@@ -237,6 +237,18 @@ class PlayerCore {
   void MaybeFireSyncGroup(bool force);  // 전원 Prerolled(또는 force)면 FireSyncGroup
   void FireSyncGroup(bool force);       // start_at 1회 계산 후 전 멤버 동시 스왑
 
+  // play_synced 자가치유: 배리어/프리롤/스왑 런타임 스톨로 특정 창의 클립이 Live가 되지 못한
+  // 경우를 뒤늦게(kLivenessHealMs) 점검·복구한다. gen이 최신 세대와 다르면(그 사이 새 play_synced가
+  // 왔으면) 무효 처리해 이미 지난 장면을 되살리지 않는다.
+  struct HealItem {
+    int window_id;
+    int track_idx;
+    double image_time_s;
+    int64_t delay_ms;
+    nlohmann::json current;
+  };
+  void HealSceneLiveness(uint64_t gen, const std::vector<HealItem>& items);
+
   // ---- 오디오 트랙 ----
   bool CheckAudioTrackPreroll(AudioTrack* track);
   void ConnectAudioTrack(AudioTrack* track);
@@ -304,6 +316,7 @@ class PlayerCore {
   std::map<int, std::unique_ptr<Surface>> surfaces_;  // window_id → 창
 
   std::unique_ptr<SyncGroup> sync_group_;  // 대기 중인 play_synced 배리어 (최대 1개)
+  uint64_t sync_generation_ = 0;           // play_synced 발행 세대 (자가치유의 stale 판정용)
 
   nlohmann::json tracks_ = nlohmann::json::array();  // set_tracks 사본 (레거시/폴백용)
   bool playlist_mode_ = false;

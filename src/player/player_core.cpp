@@ -31,6 +31,7 @@ constexpr int kCanvasWidth = 1920;   // TODO(캔버스 정책): 첫 비디오 �
 constexpr int kCanvasHeight = 1080;
 constexpr int kCanvasFps = 60;
 constexpr GstClockTime kPrerollTimeout = 15 * GST_SECOND;
+constexpr guint kLivenessHealMs = 3000;  // play_synced 후 이 시간까지 클립이 Live 못 되면 자가치유
 constexpr size_t kMaxAudioTracks = 8;  // 독립 오디오 트랙 동시 상한 (v2 §5)
 
 // 오디오 버스(믹서 출력) 포맷 — Phase 3 멀티채널: 채널수 N은 출력 디바이스를 따른다
@@ -1156,6 +1157,10 @@ void PlayerCore::SwapTo(Deck* deck) {
     deck->audio_block = 0;
   }
   deck->state = Deck::State::Live;
+  // 이 덱이 새로 라이브가 되므로 EOS 래치를 재무장한다. eos_sent는 한 번 true가 되면 다른 곳에서
+  // 리셋되지 않으므로, 재사용/승격된 덱(풀 경로 등)이 이전 재생의 EOS 플래그를 물고 오면 이번
+  // 재생의 end_reached가 영구 억제돼 장면이 안 넘어간다(에러 없이 멈춤). 라이브 전환마다 초기화.
+  deck->eos_sent = false;
   s->paused = false;
 
   // 이전 라이브 덱: start_at이 미래면 그 시각까지 유지(장면 전환 시 검정 갭 방지), 그 순간
@@ -1327,7 +1332,12 @@ void PlayerCore::TeardownDeck(Deck* deck) {
 int PlayerCore::PoolFindByPath(Surface* s, const std::string& path) {
   if (path.empty()) return -1;
   for (size_t i = 0; i < s->pool.size(); ++i) {
-    if (s->pool[i] && s->pool[i]->file.value("path", std::string()) == path)
+    if (!s->pool[i] || s->pool[i]->file.value("path", std::string()) != path) continue;
+    // 프리롤 타임아웃 등으로 죽은(Dead) 덱은 풀에 남을 수 있다(TeardownDeck은 id<0 풀 덱을
+    // s->pool에서 제거하지 않음). 이런 덱을 승격하면 절대 Live가 못 돼 play_synced가 조용히
+    // 무한 대기한다. 사용 가능한(Building/Prerolled) 덱만 매칭해 신규 빌드로 폴백하게 한다.
+    if (s->pool[i]->state == Deck::State::Building ||
+        s->pool[i]->state == Deck::State::Prerolled)
       return static_cast<int>(i);
   }
   return -1;
@@ -1391,6 +1401,13 @@ bool PlayerCore::PoolPrerollIndex(Surface* s, int seq_idx) {
 
 void PlayerCore::FillPool(Surface* s, int current_idx) {
   if (s->sequence.empty()) return;
+  // 죽은(Dead) 풀 덱 정리 — 프리롤 타임아웃으로 TeardownDeck된 뒤에도 id<0라 s->pool에 남는다.
+  // 방치하면 cap 계산을 왜곡하고 재프리롤을 막는다. (메인 루프에서 호출되므로 erase 안전.)
+  s->pool.erase(std::remove_if(s->pool.begin(), s->pool.end(),
+                               [](const std::unique_ptr<Deck>& d) {
+                                 return !d || d->state == Deck::State::Dead;
+                               }),
+                s->pool.end());
   for (int i = current_idx + 1; i <= current_idx + preload_lookahead_; ++i) {
     if (i >= static_cast<int>(s->sequence.size())) break;
     if (!PoolPrerollIndex(s, i)) break;  // 상한 도달 → 이후 트랙은 강등
@@ -1503,6 +1520,7 @@ void PlayerCore::PlaySynced(const json& msg) {
     }
   }
 
+  const int scene_idx = g->scene_idx;
   sync_group_ = std::move(g);
   MaybeFireSyncGroup(/*force=*/false);  // 이미 프리롤된 멤버만 있으면 즉시 발화
   if (sync_group_) {                     // 아직 대기 → 타임아웃 무장 (Building 멤버 커버)
@@ -1515,6 +1533,91 @@ void PlayerCore::PlaySynced(const json& msg) {
           return G_SOURCE_REMOVE;
         },
         this);
+  }
+
+  // 자가치유 워치독 무장 — 이 play_synced가 요구한 클립들이 kLivenessHealMs 안에 실제로 Live가
+  // 됐는지 나중에 점검한다. 배리어/프리롤/스왑의 런타임 스톨(죽은 풀 덱, 스왑 누락 등)로 특정 창이
+  // 안 뜨면 장면 컨트롤러(호스트)가 end_reached를 영원히 못 받아 조용히 멈추는데, 이를 플레이어가
+  // 스스로 재빌드로 복구한다. 세대(gen)를 캡처해 그 사이 새 play_synced가 오면 무효 처리.
+  const uint64_t gen = ++sync_generation_;
+  auto items = std::make_unique<std::vector<HealItem>>();
+  if (msg.contains("clips") && msg["clips"].is_array()) {
+    for (const auto& c : msg["clips"]) {
+      if (!c.contains("current") || c["current"].is_null()) continue;
+      HealItem hi;
+      hi.window_id = c.value("window_id", 0);
+      hi.track_idx = c.value("track_idx", scene_idx);
+      hi.image_time_s = c.value("current_time", c["current"].value("time", 0.0));
+      hi.delay_ms = c["current"].value("delay_ms", static_cast<int64_t>(0));
+      hi.current = c["current"];
+      items->push_back(std::move(hi));
+    }
+  }
+  if (!items->empty()) {
+    struct HealCtx {
+      PlayerCore* self;
+      uint64_t gen;
+      std::unique_ptr<std::vector<HealItem>> items;
+    };
+    auto* ctx = new HealCtx{this, gen, std::move(items)};
+    g_timeout_add(
+        kLivenessHealMs,
+        [](gpointer data) -> gboolean {
+          auto* c = static_cast<HealCtx*>(data);
+          c->self->HealSceneLiveness(c->gen, *c->items);
+          delete c;
+          return G_SOURCE_REMOVE;
+        },
+        ctx);
+  }
+}
+
+// play_synced 자가치유: 기대 클립이 Live가 되지 못한 창을 복구한다.
+void PlayerCore::HealSceneLiveness(uint64_t gen, const std::vector<HealItem>& items) {
+  if (gen != sync_generation_) return;  // 그 사이 새 play_synced가 왔음 → stale, 복구 금지
+  for (const auto& it : items) {
+    Surface* s = GetSurface(it.window_id);
+    if (!s) continue;
+    const std::string& path = it.current.value("path", std::string());
+    // 이미 기대 클립이 Live면 정상 — 아무것도 안 함.
+    if (s->live_deck >= 0 && s->decks[s->live_deck] &&
+        s->decks[s->live_deck]->state == Deck::State::Live &&
+        s->decks[s->live_deck]->file.value("path", std::string()) == path)
+      continue;
+
+    feedback_("warn", "scene liveness heal: win " + std::to_string(it.window_id) +
+                          " scene " + std::to_string(it.track_idx) +
+                          " clip not live — recovering (" + path + ")");
+
+    // 1) 슬롯에 이미 Prerolled인 동일 클립이 있으면 즉시 스왑.
+    bool healed = false;
+    for (int slot = 0; slot < 2 && !healed; ++slot) {
+      Deck* d = s->decks[slot].get();
+      if (d && d->state == Deck::State::Prerolled &&
+          d->file.value("path", std::string()) == path) {
+        d->track_idx = it.track_idx;
+        d->sync_pending = false;
+        d->start_at_rt = -1;  // 단독 복구 → 즉시(로컬 러닝타임) 스왑
+        SwapTo(d);
+        healed = true;
+      }
+    }
+    // 2) 풀에 Prerolled 동일 클립이 있으면 승격+즉시 스왑.
+    if (!healed) {
+      const int pidx = PoolFindByPath(s, path);
+      if (pidx >= 0 && s->pool[pidx]->state == Deck::State::Prerolled) {
+        s->pool[pidx]->track_idx = it.track_idx;
+        s->pool[pidx]->start_at_rt = -1;
+        PromotePooled(s, pidx, /*swap_now=*/true);
+        healed = true;
+      }
+    }
+    // 3) 최후: 대기 슬롯에 신규 빌드(프리롤 완료 시 CheckPreroll이 자동 스왑).
+    if (!healed) {
+      const int slot = (s->live_deck == 0) ? 1 : 0;
+      BuildDeck(s, slot, it.current, it.track_idx, /*play_when_ready=*/true, it.image_time_s,
+                it.delay_ms);
+    }
   }
 }
 
