@@ -334,10 +334,13 @@ gboolean SendReady(gpointer) {
                      json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
                                   "display", "timeline", "multi_window", "track_delay",
                                   "memory_status", "ptp_sync", "channel_delay", "play_synced",
-                                  "preload_status", "hwaccel", "master_volume"})}});
-  // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음)
+                                  "preload_status", "hwaccel", "hw_only", "master_volume"})}});
+  // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음).
+  // mode: hw_only(GPU 전용·폴백없음) / on(HW+SW폴백) / off(SW강제).
   SendFeedback("hwaccel_status",
                json{{"enabled", g_app->core.HwAccelEnabled()},
+                    {"mode", g_app->core.HwOnly() ? "hw_only"
+                                                  : (g_app->core.HwAccelEnabled() ? "on" : "off")},
                     {"render", g_app->core.UsesD3d11() ? "d3d11" : "software"},
                     {"decode", g_app->core.HwAccelEnabled() ? "hardware" : "software"}});
   return G_SOURCE_REMOVE;
@@ -345,13 +348,19 @@ gboolean SendReady(gpointer) {
 
 // ---------- 하드웨어 가속 토글 ----------
 
-// env VP_HWACCEL: 부재/"1"/"true"/"on"/"auto" = ON(기본), "0"/"false"/"no"/"off" = OFF.
-bool HwAccelEnabledFromEnv() {
+// env VP_HWACCEL 로 결정하는 디코드 모드.
+//   SwOnly : "0"/"false"/"no"/"off"          → HW 디코더 강등, 소프트웨어만
+//   HwOnly : "hwonly"/"hw_only"/"hardware_only"/"2" → 소프트웨어 비디오 강등, GPU만(폴백 없음)
+//   Normal : 그 외(부재/"1"/"on"/"auto")     → HW 우선 + 소프트웨어 폴백 허용(기본)
+enum class HwMode { SwOnly, Normal, HwOnly };
+HwMode HwModeFromEnv() {
   const char* v = getenv("VP_HWACCEL");
-  if (!v || !*v) return true;
+  if (!v || !*v) return HwMode::Normal;
   std::string s(v);
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-  return !(s == "0" || s == "false" || s == "no" || s == "off");
+  if (s == "0" || s == "false" || s == "no" || s == "off") return HwMode::SwOnly;
+  if (s == "hwonly" || s == "hw_only" || s == "hardware_only" || s == "2") return HwMode::HwOnly;
+  return HwMode::Normal;
 }
 
 // HW 디코더 팩토리를 GST_RANK_NONE으로 강등 → uridecodebin3가 소프트웨어(avdec_*)를 선택.
@@ -384,6 +393,28 @@ void ForceSoftwareDecoders() {
   }
 }
 
+// HW 전용 모드: 소프트웨어 "비디오" 디코더(avdec_* 등)를 GST_RANK_NONE으로 강등 → GPU 디코더만
+// 남긴다(코덱 특허 SW 디코드 회피 + "하드웨어 전용"). 오디오 디코더와 이미지 디코더(jpeg/png)는
+// 건드리지 않아 오디오/이미지는 정상 재생. GPU가 못 여는 코덱은 프리롤 실패 → codec_unsupported.
+// klass 판별: Decoder + "Video" 포함 + "Hardware" 미포함 = 소프트웨어 비디오 디코더.
+void ForceHardwareVideoDecoders() {
+  GstRegistry* reg = gst_registry_get();
+  GList* feats = gst_registry_feature_filter(
+      reg,
+      [](GstPluginFeature* f, gpointer) -> gboolean {
+        if (!GST_IS_ELEMENT_FACTORY(f)) return FALSE;
+        auto* fac = GST_ELEMENT_FACTORY(f);
+        if (!gst_element_factory_list_is_type(fac, GST_ELEMENT_FACTORY_TYPE_DECODER)) return FALSE;
+        const gchar* klass = gst_element_factory_get_metadata(fac, GST_ELEMENT_METADATA_KLASS);
+        if (!klass || !strstr(klass, "Video")) return FALSE;  // 오디오/이미지 디코더는 유지
+        return strstr(klass, "Hardware") ? FALSE : TRUE;       // 소프트웨어 비디오만 강등
+      },
+      FALSE, nullptr);
+  for (GList* l = feats; l; l = l->next)
+    gst_plugin_feature_set_rank(GST_PLUGIN_FEATURE(l->data), GST_RANK_NONE);
+  gst_plugin_feature_list_free(feats);
+}
+
 // ---------- 번들 GStreamer 격리 (배포 시) ----------
 
 void ConfigureBundledGStreamer() {
@@ -412,15 +443,18 @@ int main(int argc, char* argv[]) {
   ConfigureBundledGStreamer();
   gst_init(&argc, &argv);
 
-  // 하드웨어 가속 토글 (기동 시에만 반영 — 호스트가 VP_HWACCEL env로 전달, 변경 시 재시작).
-  const bool hwaccel = HwAccelEnabledFromEnv();
-  if (!hwaccel) ForceSoftwareDecoders();  // gst_init 이후 + 첫 파이프라인 전 (디코더 SW 강제)
+  // 하드웨어 가속 모드 (기동 시에만 반영 — 호스트가 VP_HWACCEL env로 전달, 변경 시 재시작).
+  const HwMode hw_mode = HwModeFromEnv();
+  // gst_init 이후 + 첫 파이프라인 전에 디코더 랭크 조정.
+  if (hw_mode == HwMode::SwOnly) ForceSoftwareDecoders();        // HW 디코더 강등 (소프트웨어만)
+  else if (hw_mode == HwMode::HwOnly) ForceHardwareVideoDecoders();  // SW 비디오 강등 (GPU만)
 
   App app;
   g_app = &app;
   app.loop = g_main_loop_new(nullptr, FALSE);
 
-  app.core.SetHardwareAcceleration(hwaccel);  // Init의 d3d11 렌더 프로브 게이트 (반드시 Init 전)
+  app.core.SetHardwareAcceleration(hw_mode != HwMode::SwOnly);  // Init의 d3d11 렌더 프로브 게이트 (반드시 Init 전)
+  app.core.SetHwOnly(hw_mode == HwMode::HwOnly);                // 소프트웨어 폴백 없음 (프리롤 실패=미지원)
 
   // 공유 파이프라인 + 전역 오디오 버스 구성. 창은 호스트가 create_window로 필요할 때 생성
   // (자동 주 창 없음 — 사용자가 설정한 창만 열린다).

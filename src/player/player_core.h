@@ -58,6 +58,11 @@ class PlayerCore {
   bool HwAccelEnabled() const { return hwaccel_enabled_; }  // 요청 값
   bool UsesD3d11() const { return use_d3d11_; }             // 실효 렌더 경로
 
+  // HW 전용 디코드 모드: 소프트웨어 비디오 디코더가 랭크 강등된 상태(main.cpp). true면
+  // GPU가 못 여는 코덱은 프리롤 실패 → codec_unsupported로 보고(소프트웨어 폴백 없음).
+  void SetHwOnly(bool on) { hw_only_ = on; }
+  bool HwOnly() const { return hw_only_; }
+
   // 공유 파이프라인 + 전역 오디오 버스만 구성 (창은 CreateSurface로 별도 생성)
   bool Init(FeedbackFn feedback);
   void Shutdown();
@@ -222,6 +227,8 @@ class PlayerCore {
 
   // ---- 프리롤 풀 ----
   int PoolFindByPath(Surface* s, const std::string& path);  // pool 인덱스 (-1 없음)
+  Deck* DeckForObject(GstObject* obj);  // 버스 메시지 src가 속한 덱 (활성/풀 스캔, 없으면 nullptr)
+  void EmitPlaybackError(Deck* deck, const char* fallback_reason);  // 프리롤 실패 구조화 보고
   // 풀 덱을 A/B 슬롯으로 승격. swap_now=true면 즉시(또는 delay 후) 스왑, false면 standby로.
   void PromotePooled(Surface* s, int pool_idx, bool swap_now);
   void FillPool(Surface* s, int current_idx);   // [current+1 .. current+lookahead] 프리롤
@@ -293,6 +300,7 @@ class PlayerCore {
   GstElement* master_vol_ = nullptr; // 출력단 전역 마스터 볼륨 (amix 이후 최종 volume)
   double master_volume_ = 1.0;       // 0~1 (UI 0~100)
   bool hwaccel_enabled_ = true;      // HW 가속 요청 (Init 전 SetHardwareAcceleration로 설정)
+  bool hw_only_ = false;             // HW 전용 디코드 (소프트웨어 비디오 폴백 없음)
   bool audio_fallback_active_ = false;  // sink 열기 실패로 fakesink 대체 중 (디바이스 재선택 시 해제)
   GstPad* silence_pad_ = nullptr;    // 무음 앵커의 amix 요청 패드 (matrix 갱신 지점)
   int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)

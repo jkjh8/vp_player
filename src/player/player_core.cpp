@@ -4,6 +4,7 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/audio/audio.h>
 #include <gst/net/net.h>
+#include <gst/pbutils/missing-plugins.h>
 #include <gst/video/videooverlay.h>
 
 #include <algorithm>
@@ -705,6 +706,24 @@ PlayerCore::Surface* PlayerCore::SurfaceForVsink(GstElement* vsink) {
   return nullptr;
 }
 
+// 버스 메시지의 src(GstObject)가 어느 덱 bin에 속하는지 역추적 (활성 A/B + 풀 전체 스캔).
+// 덱 수는 적어(창당 2 + 소수 풀) 선형 스캔으로 충분. 못 찾으면 nullptr.
+PlayerCore::Deck* PlayerCore::DeckForObject(GstObject* obj) {
+  if (!obj) return nullptr;
+  auto owns = [obj](Deck* d) -> bool {
+    if (!d || !d->bin) return false;
+    return obj == GST_OBJECT(d->bin) ||
+           gst_object_has_as_ancestor(obj, GST_OBJECT(d->bin));
+  };
+  for (auto& [id, s] : surfaces_) {
+    for (auto& d : s->decks)
+      if (owns(d.get())) return d.get();
+    for (auto& d : s->pool)
+      if (owns(d.get())) return d.get();
+  }
+  return nullptr;
+}
+
 GstBusSyncReply PlayerCore::OnBusSync(GstBus*, GstMessage* msg, gpointer user_data) {
   auto* self = static_cast<PlayerCore*>(user_data);
   if (gst_is_video_overlay_prepare_window_handle_message(msg)) {
@@ -737,9 +756,19 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
       GError* err = nullptr;
       gchar* dbg = nullptr;
       gst_message_parse_error(msg, &err, &dbg);
-      std::string src = GST_OBJECT_NAME(GST_MESSAGE_SRC(msg));
+      GstObject* src_obj = GST_MESSAGE_SRC(msg);
+      std::string src = GST_OBJECT_NAME(src_obj);
       const std::string emsg = err ? err->message : "unknown";
       self->feedback_("error", "pipeline error from " + src + ": " + emsg);
+
+      // 코덱/디코더 부재 (HW 전용 모드에서 GPU가 못 여는 코덱 = 소프트웨어 폴백 강등됨).
+      const bool codec_err =
+          err && ((err->domain == GST_CORE_ERROR && err->code == GST_CORE_ERROR_MISSING_PLUGIN) ||
+                  (err->domain == GST_STREAM_ERROR &&
+                   (err->code == GST_STREAM_ERROR_CODEC_NOT_FOUND ||
+                    err->code == GST_STREAM_ERROR_DECODE ||
+                    err->code == GST_STREAM_ERROR_WRONG_TYPE ||
+                    err->code == GST_STREAM_ERROR_TYPE_NOT_FOUND)));
       // 오디오 sink 열기 실패 → 무음 fakesink로 교체해 영상은 계속 재생 (파이프라인 정지 방지)
       const bool from_asink = src == "asink" || src.rfind("asink", 0) == 0;
       const bool resource_open =
@@ -749,8 +778,26 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
                    err->code == GST_RESOURCE_ERROR_BUSY ||
                    err->code == GST_RESOURCE_ERROR_NOT_FOUND));
       if (from_asink || resource_open) self->FallbackAudioSink();
+      // 실패 원인을 해당 덱에 힌트로 표시 (CheckPreroll이 playback_error reason 결정에 사용).
+      if (codec_err || (resource_open && !from_asink)) {
+        if (Deck* d = self->DeckForObject(src_obj)) {
+          if (codec_err) d->codec_error = true;
+          if (resource_open && !from_asink) d->resource_error = true;
+        }
+      }
       if (err) g_error_free(err);
       g_free(dbg);
+      break;
+    }
+    case GST_MESSAGE_ELEMENT: {
+      // 디코더 자체가 없어 autoplug 실패 시 decodebin이 missing-plugin 메시지를 올린다
+      // (HW 전용 모드에서 avdec_*가 랭크 강등되어 GPU 디코더가 유일한 경로일 때 포함).
+      if (gst_is_missing_plugin_message(msg)) {
+        if (Deck* d = self->DeckForObject(GST_MESSAGE_SRC(msg))) d->codec_error = true;
+        gchar* desc = gst_missing_plugin_message_get_description(msg);
+        self->feedback_("warn", std::string("missing decoder: ") + (desc ? desc : "unknown"));
+        g_free(desc);
+      }
       break;
     }
     case GST_MESSAGE_WARNING: {
@@ -988,7 +1035,7 @@ bool PlayerCore::CheckPreroll(Deck* deck) {
   Surface* s = deck->surface;
   GstState state = GST_STATE_NULL;
   if (gst_element_get_state(deck->bin, &state, nullptr, 0) == GST_STATE_CHANGE_FAILURE) {
-    feedback_("error", "deck preroll failed: " + deck->file.value("path", ""));
+    EmitPlaybackError(deck, "preroll_failed");
     TeardownDeck(deck);
     return false;
   }
@@ -1031,11 +1078,26 @@ bool PlayerCore::CheckPreroll(Deck* deck) {
   }
 
   if (now - deck->preroll_started > kPrerollTimeout) {
-    feedback_("error", "deck preroll timeout: " + deck->file.value("path", ""));
+    EmitPlaybackError(deck, "preroll_timeout");
     TeardownDeck(deck);
     return false;
   }
   return true;
+}
+
+// 프리롤 실패를 구조화 피드백으로 보고 (window_id + path + reason). reason은 버스 힌트 우선:
+//  파일 열기 실패 → file_error / 코덱 부재(또는 HW 전용 미지원) → codec_unsupported / 그 외 fallback.
+void PlayerCore::EmitPlaybackError(Deck* deck, const char* fallback_reason) {
+  const int wid = deck->surface ? deck->surface->id : -1;
+  const std::string path = deck->file.value("path", std::string());
+  std::string reason;
+  if (deck->resource_error)
+    reason = "file_error";
+  else if (deck->codec_error || hw_only_)  // HW 전용에서 코덱/자원 힌트 없이 실패 = GPU 미지원 코덱
+    reason = "codec_unsupported";
+  else
+    reason = fallback_reason;
+  feedback_("playback_error", json{{"window_id", wid}, {"path", path}, {"reason", reason}});
 }
 
 // ---------------------------------------------------------------------------

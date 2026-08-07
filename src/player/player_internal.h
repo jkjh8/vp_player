@@ -89,6 +89,13 @@ struct PlayerCore::Deck {
   guint image_timer = 0;
   GstClockTime image_started = 0;
   gint64 image_elapsed_ms = 0;
+
+  // 프리롤 실패 원인 힌트 (버스 핸들러가 DeckForObject로 이 덱에 매핑해 설정). CheckPreroll이
+  // 실패 시 이 힌트로 playback_error의 reason을 정한다.
+  //  codec_error    : missing-plugin / 스트림 코덱 에러 (HW 전용에서 GPU가 못 여는 코덱 포함)
+  //  resource_error : filesrc 파일 열기 실패 (경로 없음/잠김 등)
+  bool codec_error = false;
+  bool resource_error = false;
 };
 
 // ---------------------------------------------------------------------------

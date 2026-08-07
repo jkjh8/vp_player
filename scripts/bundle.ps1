@@ -78,6 +78,49 @@ while ($queue.Count -gt 0) {
   }
 }
 
+# --- 3.5 서드파티 라이센스 텍스트 수집 (LGPL/permissive 준수) ----------------------
+# 번들에 실제 포함된 컴포넌트의 라이센스 원문만 선별 복사 (미번들 GPL 컴포넌트 제외).
+$licOut = Join-Path $out "licenses"
+$gstLicDst = Join-Path $licOut "gstreamer"
+New-Item -ItemType Directory -Force $gstLicDst | Out-Null
+$gstLicSrc = Join-Path $gstRoot "share\licenses"
+# dist\player 에 실제 번들된 DLL이 유래하는 컴포넌트만 (share\licenses 하위 폴더명).
+$licComponents = @(
+  'gstreamer-1.0','gst-plugins-base-1.0','gst-plugins-bad-1.0',  # good은 별도 폴더 없음=LGPL, gstreamer-1.0가 포괄
+  'ffmpeg','glib','orc','libffi','pcre2','proxy-libintl',
+  'mpg123','libjpeg-turbo','libpng','libogg','libvorbis','opus','flac',
+  'zlib','bzip2'
+)
+$licMissing = @()
+foreach ($c in $licComponents) {
+  $src = Join-Path $gstLicSrc $c
+  if (Test-Path $src) {
+    $dst = Join-Path $gstLicDst $c
+    New-Item -ItemType Directory -Force $dst | Out-Null
+    Copy-Item (Join-Path $src '*') $dst -Recurse -Force
+  } else { $licMissing += $c }
+}
+if ($licMissing) { Write-Warning "license folders not found (share\licenses): $($licMissing -join ', ')" }
+
+# 직접 빌드한 gstasio 플러그인 (LGPL-2.1) — COPYING.LIB + 클린룸/상표 고지(README)
+$asioLicDir = Join-Path $licOut "gstasio"
+$asioLic = Join-Path $repo "third_party\gstasio\COPYING.LIB"
+if (Test-Path $asioLic) {
+  New-Item -ItemType Directory -Force $asioLicDir | Out-Null
+  Copy-Item $asioLic (Join-Path $asioLicDir "COPYING.LIB")
+  $asioReadme = Join-Path $repo "third_party\gstasio\README.md"
+  if (Test-Path $asioReadme) { Copy-Item $asioReadme (Join-Path $asioLicDir "README.md") }
+}
+
+# 라이센스 폴더 안내 파일
+$licReadme = @"
+이 폴더는 vplayer 배포본에 포함된 서드파티 라이브러리의 라이센스 원문입니다.
+- gstreamer\  : GStreamer/FFmpeg/GLib/코덱 등 (LGPL 및 permissive)
+- gstasio\    : ASIO 오디오 플러그인 (LGPL-2.1, Steinberg SDK 미사용 클린룸)
+전체 고지 및 LGPL 소스 코드 제공 안내는 상위 폴더의 THIRD-PARTY-NOTICES.md 참조.
+"@
+Set-Content -Path (Join-Path $licOut "README.txt") -Value $licReadme -Encoding UTF8
+
 # --- 4. MSVC 런타임 (앱 로컬 배치 — 대상 PC의 vc_redist 미설치 대비) ----------------
 $crt = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($crt) {
@@ -89,7 +132,8 @@ if ($crt) {
 # --- 5. 요약 --------------------------------------------------------------------
 $coreCount = (Get-ChildItem $out -Filter *.dll -File).Count
 $plugCount = (Get-ChildItem $outPlugins -Filter *.dll -File).Count
+$licCount = (Get-ChildItem $licOut -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
 $sizeMB = [math]::Round(((Get-ChildItem $out -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB, 1)
 Write-Host ""
 Write-Host "=== bundle complete: $out ==="
-Write-Host "core DLLs: $coreCount, plugins: $plugCount, total size: $sizeMB MB"
+Write-Host "core DLLs: $coreCount, plugins: $plugCount, license files: $licCount, total size: $sizeMB MB"
