@@ -53,13 +53,19 @@ if (Test-Path $asioDll) { Copy-Item $asioDll $outPlugins } else { Write-Warning 
 # --- 2. exe 복사 ---------------------------------------------------------------
 Copy-Item $exe $out
 
+# gst-ptp-helper.exe (멀티 PC PTP/IEEE1588) — GStreamer libexec에서 exe 옆으로 복사.
+# main.cpp의 ConfigureBundledGStreamer가 이 경로를 GST_PTP_HELPER로 지정 → gst_ptp_init 성공.
+# (미포함 시 번들 GStreamer에 헬퍼가 없어 gst_ptp_init 실패 = PTP 동기 불가.)
+$ptpHelper = Join-Path $gstRoot "libexec\gstreamer-1.0\gst-ptp-helper.exe"
+if (Test-Path $ptpHelper) { Copy-Item $ptpHelper $out } else { Write-Warning "gst-ptp-helper.exe not found — 멀티 PC PTP 미동작" }
+
 # --- 3. DLL 의존성 클로저 (dumpbin /dependents, GStreamer bin 안에서만 해석) -------
 $dumpbin = Get-ChildItem "${env:ProgramFiles}\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $dumpbin) { throw "dumpbin.exe not found (VS2022 C++ tools 필요)" }
 
 $resolved = @{}   # 소문자 dll명 → 복사 완료
 $queue = New-Object System.Collections.Queue
-(Get-ChildItem $out -Filter *.dll -Recurse) + (Get-Item (Join-Path $out "vplayer.exe")) | ForEach-Object { $queue.Enqueue($_.FullName) }
+(Get-ChildItem $out -Filter *.dll -Recurse) + (Get-ChildItem $out -Filter *.exe -File) | ForEach-Object { $queue.Enqueue($_.FullName) }
 
 while ($queue.Count -gt 0) {
   $file = $queue.Dequeue()

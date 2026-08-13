@@ -90,6 +90,7 @@ void HandleCommand(const json& msg) {
   if (cmd == "create_window") {
     std::string aspect = msg.value("aspect_mode", std::string("letterbox"));
     const bool ok = core.CreateSurface(wid, PlacementFromJson(msg), aspect);
+    if (ok) core.SetWindowZOrder(wid, msg.value("z_order", 0));  // 생성 직후 z 스택 반영
     SendFeedback("windows", json{{"windows", core.ListSurfaces()}, {"created", wid}, {"ok", ok}});
   } else if (cmd == "destroy_window") {
     core.DestroySurface(wid);
@@ -200,6 +201,7 @@ void HandleCommand(const json& msg) {
     }
     const std::string aspect_mode = msg.value("aspect_mode", std::string("letterbox"));
     core.SetAspectMode(aspect_mode, target_w, target_h, wid);
+    if (msg.contains("z_order")) core.SetWindowZOrder(wid, msg.value("z_order", 0));
     SendFeedback("set_display", msg);
   } else if (cmd == "get_audio_devices") {
     SendFeedback("audiodevices", json{{"devices", core.ListAudioDevices()}});
@@ -427,6 +429,13 @@ void ConfigureBundledGStreamer() {
 
   _wputenv_s(L"GST_PLUGIN_PATH", plugins.c_str());
   _wputenv_s(L"GST_PLUGIN_SYSTEM_PATH_1_0", L"");
+  // 멀티 PC PTP(IEEE1588): 번들에 동봉한 gst-ptp-helper.exe를 gst_ptp_init이 쓰도록 절대경로 지정.
+  // (미지정 시 GStreamer는 <prefix>/libexec 를 찾는데 번들 레이아웃엔 없어 gst_ptp_init이 실패한다.)
+  const auto ptp_helper = std::filesystem::path(exe_path).parent_path() / L"gst-ptp-helper.exe";
+  if (std::filesystem::exists(ptp_helper)) {
+    _wputenv_s(L"GST_PTP_HELPER_1_0", ptp_helper.c_str());
+    _wputenv_s(L"GST_PTP_HELPER", ptp_helper.c_str());  // 버전별 변수명 차이 대비
+  }
   wchar_t local_appdata[MAX_PATH];
   if (GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH) > 0) {
     const auto registry = std::filesystem::path(local_appdata) / L"vpapp" / L"gst-registry.bin";
