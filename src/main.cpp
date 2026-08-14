@@ -103,10 +103,13 @@ void HandleCommand(const json& msg) {
     core.PreloadPlaylist(msg);
   } else if (cmd == "enable_ptp") {
     core.EnablePtp(msg.value("domain", 0));
+  } else if (cmd == "enable_net_clock") {
+    core.EnableNetClock(msg.value("role", std::string("master")),
+                        msg.value("address", std::string("")), msg.value("port", 15004));
   } else if (cmd == "ptp_base_time") {
     core.SetPtpBaseTime(msg.value("base_time", static_cast<int64_t>(0)));
   } else if (cmd == "get_running_time") {
-    SendFeedback("running_time", core.PtpStatus());
+    SendFeedback("running_time", core.ClockStatus());
   } else if (cmd == "playid" || cmd == "set_media") {
     if (!msg.contains("file")) {
       SendFeedback("error", cmd + ": file missing");
@@ -335,8 +338,9 @@ gboolean SendReady(gpointer) {
                json{{"features",
                      json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
                                   "display", "timeline", "multi_window", "track_delay",
-                                  "memory_status", "ptp_sync", "channel_delay", "play_synced",
-                                  "preload_status", "hwaccel", "hw_only", "master_volume"})}});
+                                  "memory_status", "ptp_sync", "net_clock", "channel_delay",
+                                  "play_synced", "preload_status", "hwaccel", "hw_only",
+                                  "master_volume"})}});
   // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음).
   // mode: hw_only(GPU 전용·폴백없음) / on(HW+SW폴백) / off(SW강제).
   SendFeedback("hwaccel_status",

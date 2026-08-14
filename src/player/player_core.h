@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <gst/gst.h>
+#include <gst/net/net.h>  // 넷클럭(GstNetTimeProvider/GstNetClientClock) — 멀티 PC 소프트웨어 동기
 
 #include <cstdint>
 #include <functional>
@@ -88,6 +89,10 @@ class PlayerCore {
   // 창 재배치 (라이브 모니터/좌표/크기) — 창 스레드로 마샬링
   void ApplyDisplayPlacement(const WindowPlacement& placement, int window_id = 0);
   void SetFullscreen(bool fullscreen, int window_id = 0);
+  // 창 z-order (겹칠 때 앞뒤). z가 클수록 앞. 값 저장 후 전 창 스택을 재적용한다.
+  void SetWindowZOrder(int window_id, int z_order);
+  // 전 창을 z_order 내림차순(앞→뒤)으로 SetWindowPos 체인 재배치. 풀스크린(TOPMOST) 창은 제외.
+  void RestackWindows();
 
   // ---- 재생 (window_id 기본 0 = 주 창, 하위호환) -----------------------------
   // file: 호스트가 주는 file 객체 (path 필수). image_time_s: 이미지 표시 시간(초, 0=무한).
@@ -170,9 +175,16 @@ class PlayerCore {
   // PTP(IEEE 1588) 멀티캐스트 클럭으로 전환 (전 PC가 같은 절대 시각 공유). 기본은 시스템
   // 클록이며 명시 호출 시에만 전환 — 단일 머신 동작은 불변.
   void EnablePtp(int domain);
-  void SetPtpBaseTime(int64_t base_time);  // slave: master base_time 맞춰 러닝타임 동기
+  void SetPtpBaseTime(int64_t base_time);  // slave: master base_time 맞춰 러닝타임 동기 (PTP/넷클럭 공용)
   int64_t GetRunningTimeNs() const;        // 현재 공유 러닝타임(ns) — start_at 계산 기준
   nlohmann::json PtpStatus() const;
+
+  // 소프트웨어 넷클럭 (GstNet) — 하드웨어/네트워크 PTP 미지원·미동기 시 폴백. AES67/Dante PTP와 독립.
+  // role="master" → NetTimeProvider(이 PC가 클럭 마스터=시간 소스). role="slave" → NetClientClock로
+  // master 시각에 동기 후 파이프라인 클록으로 사용. base_time은 SetPtpBaseTime 공용.
+  void EnableNetClock(const std::string& role, const std::string& address, int port);
+  nlohmann::json NetClockStatus() const;
+  nlohmann::json ClockStatus() const;  // 현재 활성 클럭(ptp/netclock/system)의 통합 상태
 
  private:
   struct Deck;
@@ -320,6 +332,13 @@ class PlayerCore {
   GstClock* ptp_clock_ = nullptr;
   bool ptp_enabled_ = false;
   int ptp_domain_ = 0;
+
+  // 넷클럭 (GstNet 소프트웨어 동기). master는 provider를 유지, slave는 client clock을 파이프라인
+  // 클록으로 사용. PTP와 상호배타(하나만 활성).
+  GstNetTimeProvider* net_time_provider_ = nullptr;
+  GstClock* net_client_clock_ = nullptr;
+  bool net_clock_enabled_ = false;
+  bool net_clock_master_ = false;
 
   std::map<int, std::unique_ptr<Surface>> surfaces_;  // window_id → 창
 

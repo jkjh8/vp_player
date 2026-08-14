@@ -486,6 +486,7 @@ json PlayerCore::ListSurfaces() const {
                    {"aspect_mode", s->aspect_mode},
                    {"width", s->window.client_width()},
                    {"height", s->window.client_height()},
+                   {"z_order", s->z_order},
                    {"fullscreen", s->window.IsFullscreen()}});
   }
   return arr;
@@ -522,6 +523,35 @@ void PlayerCore::ApplyDisplayPlacement(const WindowPlacement& placement, int win
 
 void PlayerCore::SetFullscreen(bool fullscreen, int window_id) {
   if (Surface* s = GetSurface(window_id)) s->window.SetFullscreen(fullscreen);
+}
+
+void PlayerCore::SetWindowZOrder(int window_id, int z_order) {
+  Surface* s = GetSurface(window_id);
+  if (!s) return;
+  s->z_order = z_order;
+  RestackWindows();
+}
+
+void PlayerCore::RestackWindows() {
+  // z_order 내림차순(앞→뒤). 동률은 id 오름차순으로 안정 정렬.
+  std::vector<Surface*> ordered;
+  for (auto& [id, surf] : surfaces_) {
+    if (!surf || !surf->hwnd) continue;
+    if (surf->window.IsFullscreen()) continue;  // 풀스크린 창은 TOPMOST 대역 — 건드리지 않음
+    ordered.push_back(surf.get());
+  }
+  std::sort(ordered.begin(), ordered.end(), [](const Surface* a, const Surface* b) {
+    if (a->z_order != b->z_order) return a->z_order > b->z_order;
+    return a->id < b->id;
+  });
+  // 앞쪽부터 배치: 첫 창을 최상단으로, 이후 창을 바로 뒤에 삽입해 체인을 만든다.
+  // SetWindowPos(hwnd, insertAfter, ...)는 hwnd를 insertAfter '바로 뒤'에 놓는다.
+  HWND insert_after = HWND_TOP;
+  for (Surface* s : ordered) {
+    SetWindowPos(s->hwnd, insert_after, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    insert_after = s->hwnd;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,10 +1188,10 @@ void PlayerCore::EnablePtp(int domain) {
 }
 
 void PlayerCore::SetPtpBaseTime(int64_t base_time) {
-  // slave: master의 base_time에 맞춤 → RunningTime()=clock-base_time 전 PC 동일.
+  // slave: master의 base_time에 맞춤 → RunningTime()=clock-base_time 전 PC 동일. (PTP/넷클럭 공용)
   // 재생 시작 전에 호출되는 것을 전제(재생 중 변경은 러닝타임을 흔들 수 있음).
   gst_element_set_base_time(pipeline_, static_cast<GstClockTime>(base_time));
-  feedback_("ptp_status", PtpStatus());
+  feedback_("net_clock_status", ClockStatus());
 }
 
 nlohmann::json PlayerCore::PtpStatus() const {
@@ -1171,6 +1201,69 @@ nlohmann::json PlayerCore::PtpStatus() const {
                         {"synced", synced},
                         {"base_time", static_cast<int64_t>(gst_element_get_base_time(pipeline_))},
                         {"running_time", static_cast<int64_t>(RunningTime())}};
+}
+
+// 소프트웨어 넷클럭 활성화 (PTP 대체·폴백). master=시간 제공, slave=원격 시각 동기.
+void PlayerCore::EnableNetClock(const std::string& role, const std::string& address, int port) {
+  const bool is_master = (role == "master");
+  // 기존 넷클럭 자원 정리 (재구성 대비)
+  if (net_time_provider_) {
+    gst_object_unref(net_time_provider_);
+    net_time_provider_ = nullptr;
+  }
+  if (net_client_clock_) {
+    gst_object_unref(net_client_clock_);
+    net_client_clock_ = nullptr;
+  }
+
+  if (is_master) {
+    // 이 PC가 클럭 마스터: 시스템 클록을 네트워크로 제공. 파이프라인은 시스템 클록 유지.
+    GstClock* sysclock = gst_system_clock_obtain();
+    net_time_provider_ =
+        gst_net_time_provider_new(sysclock, address.empty() ? nullptr : address.c_str(), port);
+    gst_pipeline_use_clock(GST_PIPELINE(pipeline_), sysclock);
+    gst_object_unref(sysclock);
+    if (!net_time_provider_) {
+      feedback_("error", "net_clock: gst_net_time_provider_new failed");
+      return;
+    }
+    net_clock_master_ = true;
+  } else {
+    // slave: master 시각에 동기하는 client clock을 파이프라인 클록으로 (best-effort 5s 대기).
+    net_client_clock_ = gst_net_client_clock_new("vp-netclock", address.c_str(), port, 0);
+    if (!net_client_clock_) {
+      feedback_("error", "net_clock: gst_net_client_clock_new failed");
+      return;
+    }
+    gst_clock_wait_for_sync(net_client_clock_, 5 * GST_SECOND);
+    gst_pipeline_use_clock(GST_PIPELINE(pipeline_), net_client_clock_);
+    net_clock_master_ = false;
+  }
+  net_clock_enabled_ = true;
+  ptp_enabled_ = false;  // PTP와 상호배타
+  feedback_("net_clock_status", NetClockStatus());
+}
+
+nlohmann::json PlayerCore::NetClockStatus() const {
+  bool synced = false;
+  if (net_clock_master_)
+    synced = true;  // 마스터는 권위 시간 소스 = 항상 동기됨
+  else if (net_client_clock_)
+    synced = (bool)gst_clock_is_synced(net_client_clock_);
+  return nlohmann::json{{"enabled", net_clock_enabled_},
+                        {"mode", "netclock"},
+                        {"role", net_clock_master_ ? "master" : "slave"},
+                        {"synced", synced},
+                        {"base_time", static_cast<int64_t>(gst_element_get_base_time(pipeline_))},
+                        {"running_time", static_cast<int64_t>(RunningTime())}};
+}
+
+// 현재 활성 클럭의 통합 상태 (get_running_time 응답 — 호스트가 mode/synced로 전략 판정).
+nlohmann::json PlayerCore::ClockStatus() const {
+  if (net_clock_enabled_) return NetClockStatus();
+  auto s = PtpStatus();
+  s["mode"] = ptp_enabled_ ? "ptp" : "system";
+  return s;
 }
 
 void PlayerCore::SwapTo(Deck* deck) {

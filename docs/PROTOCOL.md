@@ -896,12 +896,15 @@ sink)는 전역 공유** — 전 창의 모든 덱이 하나의 amix로 믹스�
 
 ## 6.1 창 생명주기
 
-- `create_window {window_id, monitor_index?, x?, y?, width?, height?, aspect_mode?}`
+- `create_window {window_id, monitor_index?, x?, y?, width?, height?, aspect_mode?, z_order?}`
   창을 동적 생성(테두리 없는 borderless Win32 창 + comp/vsink/배경/로고). 주 창(0)은 부팅 시
-  자동 생성됨.
+  자동 생성됨. `z_order`(기본 0)는 창이 겹칠 때 쌓임 순서 — 값이 클수록 앞(위).
 - `destroy_window {window_id}` 창 해체 (해당 창의 덱/풀 정리 + 창 파괴).
-- `get_windows` → `P→H {"type":"windows","data":{"windows":[{window_id,aspect_mode,width,height,fullscreen}, ...]}}`
+- `get_windows` → `P→H {"type":"windows","data":{"windows":[{window_id,aspect_mode,width,height,z_order,fullscreen}, ...]}}`
 - 창 생성/삭제 응답도 `windows` 피드백으로 최신 목록을 함께 보낸다(`created`/`destroyed` 키 포함).
+- **z-order:** `create_window`/`set_display`에 `z_order`가 실리면 전 창을 `z_order` 내림차순(앞→뒤)으로
+  재적층한다(Win32 `SetWindowPos` 체인). 겹치는 창의 레이어/PIP 합성 순서를 정한다. 풀스크린 창은
+  TOPMOST 대역이라 재적층 대상에서 제외된다.
 
 ## 6.2 window_id 주소 (기존 명령 확장)
 
@@ -1020,12 +1023,15 @@ P→H {"type":"memory_status","data":{
 
 ```json
 {"command":"get_displays"}
-{"command":"set_display","window_id":1,"monitor_index":-1,"x":0,"y":0,"width":0,"height":0,"aspect_mode":"letterbox"}
+{"command":"set_display","window_id":1,"monitor_index":-1,"x":0,"y":0,"width":0,"height":0,"aspect_mode":"letterbox","z_order":0}
 ```
 - `get_displays` → `P→H {"type":"displays","data":{"displays":[{index,primary,x,y,width,height,...}]}}`.
 - `set_display`(창별, §6.2 `window_id` 기본 0): 대상 창을 모니터/좌표/크기/비율로 재배치. `width/height=0`
   = 모니터 전체. 처리 후 `P→H {"type":"set_display","data":{...적용값...}}` echo(호스트가 영속).
 - `aspect_mode`: `"letterbox"|"crop"|"stretch"`.
+- `z_order`(선택): 지정 시 겹침 순서를 갱신하고 전 창을 재적층한다(§6.1 참고, 클수록 앞). 창은 절대
+  좌표(가상 데스크톱)에 배치되므로 `width/height`를 크게 주면 한 창이 여러 모니터에 걸칠 수 있다
+  (풀스크린 전환 시에는 단일 모니터로 스냅).
 
 ## 7.5 멀티 PC PTP 동기 `enable_ptp` / `ptp_base_time` / `get_running_time`
 

@@ -154,6 +154,7 @@ struct PlayerCore::Surface {
   int aspect_target_w = 0;
   int aspect_target_h = 0;
   bool overlay_ready = false;
+  int z_order = 0;  // 겹칠 때 쌓임 순서 (클수록 앞). RestackWindows가 SetWindowPos 체인으로 적용.
 
   std::unique_ptr<Deck> decks[2];
   int live_deck = -1;
