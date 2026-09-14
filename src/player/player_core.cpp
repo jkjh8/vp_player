@@ -437,6 +437,7 @@ bool PlayerCore::BuildSurfaceGraph(Surface* s) {
 
 void PlayerCore::TeardownSurfaceGraph(Surface* s) {
   ClearPool(s);
+  TeardownLiveSource(s);  // 라이브 레이어(comp 사용)를 comp 제거 전에 먼저 해체
   if (s->decks[0]) TeardownDeck(s->decks[0].get());
   if (s->decks[1]) TeardownDeck(s->decks[1].get());
   // comp/vsink/bg/logo를 파이프라인에서 제거 (bin_remove가 unref). 개별 요소 참조는 보관하지
@@ -814,6 +815,15 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
           if (codec_err) d->codec_error = true;
           if (resource_open && !from_asink) d->resource_error = true;
         }
+      }
+      // 라이브 입력 소스 오류 → source_status(error). 워치독(스톨 감지)이 재빌드로 복구 시도.
+      if (Surface* ls = self->SurfaceForLiveObject(src_obj)) {
+        if (codec_err) ls->live.codec_error = true;
+        if (resource_open) ls->live.resource_error = true;
+        const char* reason = ls->live.resource_error
+                                 ? "file_error"
+                                 : (ls->live.codec_error ? "codec_unsupported" : "connection_error");
+        self->EmitSourceStatus(ls, "error", reason);
       }
       if (err) g_error_free(err);
       g_free(dbg);
@@ -1279,7 +1289,8 @@ void PlayerCore::SwapTo(Deck* deck) {
     gst_element_add_pad(deck->bin, deck->video_ghost);
 
     deck->comp_pad = gst_element_request_pad_simple(s->comp, "sink_%u");
-    g_object_set(deck->comp_pad, "zorder", (guint)(1 + deck->id), "alpha", 1.0, "xpos", 0, "ypos",
+    // zorder = 2 + id (덱0→2, 덱1→3). zorder 1은 라이브 입력 레이어 예약(배경 0 위, 덱 아래).
+    g_object_set(deck->comp_pad, "zorder", (guint)(2 + deck->id), "alpha", 1.0, "xpos", 0, "ypos",
                  0, "width", kCanvasWidth, "height", kCanvasHeight, nullptr);
     g_object_set(deck->comp_pad, "sizing-policy", 1, nullptr);
     gst_pad_set_offset(deck->video_out, static_cast<gint64>(offset));
@@ -1348,7 +1359,7 @@ void PlayerCore::SwapTo(Deck* deck) {
             }
             // 남은(현재 라이브) 덱 zorder를 기본으로 복귀 → 다음 전환에서 새 덱이 다시 위로.
             if (sf->decks[c->new_id] && sf->decks[c->new_id]->comp_pad)
-              g_object_set(sf->decks[c->new_id]->comp_pad, "zorder", (guint)(1 + c->new_id),
+              g_object_set(sf->decks[c->new_id]->comp_pad, "zorder", (guint)(2 + c->new_id),
                            nullptr);
             delete c;
             return G_SOURCE_REMOVE;
@@ -1478,6 +1489,476 @@ void PlayerCore::TeardownDeck(Deck* deck) {
     if (s->standby_deck == id) s->standby_deck = -1;
     s->decks[id].reset();
   }
+}
+
+// ---------------------------------------------------------------------------
+// 라이브 입력 소스 (창 귀속 지속 레이어) — RTP / RTSP / SRT
+// ---------------------------------------------------------------------------
+
+namespace {
+// 인코딩명(SDP) → RTP 디페이로더 팩토리. 순수 RTP는 depay가 인코딩별로 달라 명시 매핑한다.
+const char* RtpDepayFor(const std::string& enc) {
+  std::string e;
+  for (char c : enc) e += (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+  if (e == "H264") return "rtph264depay";
+  if (e == "H265" || e == "HEVC") return "rtph265depay";
+  if (e == "VP8") return "rtpvp8depay";
+  if (e == "VP9") return "rtpvp9depay";
+  if (e == "JPEG") return "rtpjpegdepay";
+  // MPEG-TS over RTP (VLC 기본 RTP 송출 형식, payload 33). depay 출력(video/mpegts)은
+  // decodebin이 tsdemux+디코더로 처리하므로 이후 체인(depay→decodebin)은 그대로 동작.
+  if (e == "MP2T" || e == "MP2T-ES" || e == "MP2TS" || e == "TS") return "rtpmp2tdepay";
+  return nullptr;
+}
+}  // namespace
+
+PlayerCore::Surface* PlayerCore::SurfaceForLiveObject(GstObject* obj) {
+  if (!obj) return nullptr;
+  for (auto& [id, s] : surfaces_) {
+    if (s->live.bin && (obj == GST_OBJECT(s->live.bin) ||
+                        gst_object_has_as_ancestor(obj, GST_OBJECT(s->live.bin))))
+      return s.get();
+  }
+  return nullptr;
+}
+
+void PlayerCore::EmitSourceStatus(Surface* s, const char* state, const char* reason) {
+  s->live.state = state;
+  json data = {{"window_id", s->id}, {"kind", s->live.kind}, {"state", state}};
+  if (reason && *reason) data["reason"] = reason;
+  feedback_("source_status", data);
+}
+
+// uridecodebin3(rtsp/srt)가 실제 소스 요소를 만들 때 지연/재전송 설정 (있는 프로퍼티만).
+void PlayerCore::OnLiveSourceSetup(GstElement*, GstElement* source, gpointer user_data) {
+  auto* s = static_cast<Surface*>(user_data);
+  const int latency_ms = s->live.params.value("latency_ms", 200);
+  GObjectClass* klass = G_OBJECT_GET_CLASS(source);
+  if (g_object_class_find_property(klass, "latency"))
+    g_object_set(source, "latency", (guint)std::max(0, latency_ms), nullptr);
+  if (g_object_class_find_property(klass, "do-retransmission"))
+    g_object_set(source, "do-retransmission", TRUE, nullptr);
+}
+
+// pad-added(스트리밍 스레드): 디코드된 pad로 브랜치를 bin 안에 만들고 블록 프로브로 홀드한 뒤,
+// comp/amix 링크는 메인 스레드로 마샬링(LinkLiveVideo/LinkLiveAudio) — 덱과 동일 안전 규약.
+void PlayerCore::OnLiveSourcePadAdded(GstElement*, GstPad* pad, gpointer user_data) {
+  auto* s = static_cast<Surface*>(user_data);
+  PlayerCore* core = s->core;
+
+  GstCaps* caps = gst_pad_get_current_caps(pad);
+  if (!caps) caps = gst_pad_query_caps(pad, nullptr);
+  const gchar* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
+  const bool is_video = g_str_has_prefix(name, "video/");
+  const bool is_audio = g_str_has_prefix(name, "audio/");
+  gst_caps_unref(caps);
+
+  if (is_video && !s->live.video_tail) {
+    GstElement* q = MakeElement("queue", nullptr);
+    // 라이브 지터/누적 방지: 오래된 프레임은 버린다(leaky downstream).
+    g_object_set(q, "leaky", 2, "max-size-time", (guint64)0, "max-size-bytes", (guint)0,
+                 "max-size-buffers", (guint)4, nullptr);
+    GstElement* upload = core->use_d3d11_ ? MakeElement("d3d11upload", nullptr) : nullptr;
+    GstElement* convert =
+        core->use_d3d11_ ? MakeElement("d3d11convert", nullptr) : MakeElement("videoconvert", nullptr);
+
+    gst_bin_add_many(GST_BIN(s->live.bin), q, convert, nullptr);
+    if (upload) gst_bin_add(GST_BIN(s->live.bin), upload);
+    bool ok = upload ? gst_element_link_many(q, upload, convert, nullptr)
+                     : gst_element_link(q, convert);
+    GstPad* qsink = gst_element_get_static_pad(q, "sink");
+    ok = ok && gst_pad_link(pad, qsink) == GST_PAD_LINK_OK;
+    gst_object_unref(qsink);
+
+    s->live.video_tail = convert;
+    s->live.video_out = gst_element_get_static_pad(convert, "src");
+    // 링크 전 데이터 홀드 (메인 스레드가 comp에 링크할 때까지)
+    s->live.video_block = gst_pad_add_probe(
+        s->live.video_out,
+        static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER),
+        [](GstPad*, GstPadProbeInfo*, gpointer) -> GstPadProbeReturn { return GST_PAD_PROBE_OK; },
+        nullptr, nullptr);
+
+    gst_element_sync_state_with_parent(q);
+    if (upload) gst_element_sync_state_with_parent(upload);
+    gst_element_sync_state_with_parent(convert);
+    if (!ok) InvokeOnMain([core] { core->feedback_("error", "live: video branch link failed"); });
+    InvokeOnMain([core, s] { if (s->live.active) core->LinkLiveVideo(s); });
+  } else if (is_audio && s->live.has_audio && !s->live.audio_tail) {
+    GstElement* q = MakeElement("queue", nullptr);
+    g_object_set(q, "leaky", 2, "max-size-time", (guint64)0, "max-size-bytes", (guint)0,
+                 "max-size-buffers", (guint)0, nullptr);
+    GstElement* conv = MakeElement("audioconvert", nullptr);
+    GstElement* res = MakeElement("audioresample", nullptr);
+    GstElement* capsf = MakeElement("capsfilter", nullptr);
+    {
+      GstCaps* bcaps = MakeBranchCaps(s->live.branch_channels);
+      g_object_set(capsf, "caps", bcaps, nullptr);
+      gst_caps_unref(bcaps);
+    }
+    GstElement* vol = MakeElement("volume", nullptr);
+    g_object_set(vol, "volume", s->live.master_muted ? 0.0 : s->live.volume_gain, nullptr);
+
+    gst_bin_add_many(GST_BIN(s->live.bin), q, conv, res, capsf, vol, nullptr);
+    bool ok = gst_element_link_many(q, conv, res, capsf, vol, nullptr);
+    GstPad* qsink = gst_element_get_static_pad(q, "sink");
+    ok = ok && gst_pad_link(pad, qsink) == GST_PAD_LINK_OK;
+    gst_object_unref(qsink);
+
+    s->live.audio_tail = vol;
+    s->live.audio_out = gst_element_get_static_pad(vol, "src");
+    s->live.audio_block = gst_pad_add_probe(
+        s->live.audio_out,
+        static_cast<GstPadProbeType>(GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER),
+        [](GstPad*, GstPadProbeInfo*, gpointer) -> GstPadProbeReturn { return GST_PAD_PROBE_OK; },
+        nullptr, nullptr);
+
+    gst_element_sync_state_with_parent(q);
+    gst_element_sync_state_with_parent(conv);
+    gst_element_sync_state_with_parent(res);
+    gst_element_sync_state_with_parent(capsf);
+    gst_element_sync_state_with_parent(vol);
+    if (!ok) InvokeOnMain([core] { core->feedback_("error", "live: audio branch link failed"); });
+    InvokeOnMain([core, s] { if (s->live.active) core->LinkLiveAudio(s); });
+  }
+}
+
+void PlayerCore::LinkLiveVideo(Surface* s) {
+  auto& L = s->live;
+  if (!L.active || !L.video_out || L.comp_pad) return;  // 이미 링크됨/무효
+  L.video_ghost = gst_ghost_pad_new("live_video_src", L.video_out);
+  gst_pad_set_active(L.video_ghost, TRUE);
+  gst_element_add_pad(L.bin, L.video_ghost);
+
+  L.comp_pad = gst_element_request_pad_simple(s->comp, "sink_%u");
+  // zorder 1 = 배경(0) 위, 덱(2+id) 아래. 라이브가 창의 상시 배경, 클립 재생 시 클립이 위로.
+  g_object_set(L.comp_pad, "zorder", (guint)1, "alpha", 1.0, "xpos", 0, "ypos", 0, "width",
+               kCanvasWidth, "height", kCanvasHeight, "sizing-policy", 1, nullptr);
+  // 라이브는 이미 러닝타임 타임스탬프 → pad offset 불필요(덱은 파일이라 offset=RunningTime 필요).
+  if (gst_pad_link(L.video_ghost, L.comp_pad) != GST_PAD_LINK_OK)
+    feedback_("error", "live: video link to compositor failed");
+
+  if (L.video_block) {
+    gst_pad_remove_probe(L.video_out, L.video_block);
+    L.video_block = 0;
+  }
+  // 스톨 감지 + 첫 버퍼 → playing 전환 (스트리밍 스레드에서 타임스탬프 기록).
+  L.buffer_probe = gst_pad_add_probe(
+      L.video_out, GST_PAD_PROBE_TYPE_BUFFER,
+      [](GstPad*, GstPadProbeInfo*, gpointer u) -> GstPadProbeReturn {
+        auto* s = static_cast<Surface*>(u);
+        s->live.last_buffer_us = g_get_monotonic_time();
+        if (!s->live.got_first.exchange(true)) {
+          PlayerCore* c = s->core;
+          InvokeOnMain([c, s] {
+            if (s->live.active) c->EmitSourceStatus(s, "playing", nullptr);
+          });
+        }
+        return GST_PAD_PROBE_OK;
+      },
+      s, nullptr);
+
+  s->media_wants_logo = false;
+  UpdateLogoVisibility(s, /*emit_feedback=*/true);
+  gst_bin_recalculate_latency(GST_BIN(pipeline_));
+}
+
+void PlayerCore::LinkLiveAudio(Surface* s) {
+  auto& L = s->live;
+  if (!L.active || !L.audio_out || L.amix_pad) return;
+  L.audio_ghost = gst_ghost_pad_new("live_audio_src", L.audio_out);
+  gst_pad_set_active(L.audio_ghost, TRUE);
+  gst_element_add_pad(L.bin, L.audio_ghost);
+
+  L.amix_pad = gst_element_request_pad_simple(amix_, "sink_%u");
+  SetPadMatrix(L.amix_pad, L.branch_channels, output_channels_, L.channel_routes);
+  if (gst_pad_link(L.audio_ghost, L.amix_pad) != GST_PAD_LINK_OK)
+    feedback_("error", "live: audio link to mixer failed");
+
+  if (L.audio_block) {
+    gst_pad_remove_probe(L.audio_out, L.audio_block);
+    L.audio_block = 0;
+  }
+  gst_bin_recalculate_latency(GST_BIN(pipeline_));
+}
+
+bool PlayerCore::BuildLiveSource(Surface* s, const json& params, bool reconnect) {
+  TeardownLiveSource(s);  // 기존 소스 교체/재빌드
+
+  const std::string kind = params.value("kind", std::string());
+  auto& L = s->live;
+  L.params = params;
+  L.kind = kind;
+  L.has_audio = params.value("has_audio", false);
+  L.codec_error = false;
+  L.resource_error = false;
+  L.got_first = false;
+  L.last_buffer_us = g_get_monotonic_time();
+  {
+    StreamAudio sa = ParseFileAudio(params);
+    L.channel_routes = sa.routes;
+    L.volume_gain = sa.volume_gain;
+    L.master_muted = sa.master_muted;
+    L.branch_channels = sa.routes.empty() ? 2 : static_cast<int>(sa.routes.size());
+  }
+
+  const std::string sfx = std::to_string(s->id);
+  L.bin = gst_bin_new(("live" + sfx).c_str());
+
+  if (kind == "rtsp" || kind == "srt") {
+    const std::string uri = params.value("uri", std::string());
+    if (uri.empty()) {
+      feedback_("error", "set_window_source: uri required for " + kind);
+      gst_object_unref(L.bin);
+      L.bin = nullptr;
+      return false;
+    }
+    L.decode = MakeElement("uridecodebin3", nullptr);
+    g_object_set(L.decode, "uri", uri.c_str(), nullptr);
+    g_signal_connect(L.decode, "source-setup", G_CALLBACK(OnLiveSourceSetup), s);
+    g_signal_connect(L.decode, "pad-added", G_CALLBACK(OnLiveSourcePadAdded), s);
+    gst_bin_add(GST_BIN(L.bin), L.decode);
+  } else if (kind == "rtp" || kind == "udp") {
+    // 네트워크 스트림 수신. rtp = RTP 헤더 있음, udp = 순수 UDP(RTP 헤더 없음, 보통 MPEG-TS 원본).
+    // 코덱은 decodebin이 자동 감지하므로 사용자가 지정할 필요 없음(비트레이트도 스트림에 내재).
+    const json rtp = params.value("rtp", json::object());
+    const int port = rtp.value("port", 5004);
+    const std::string address = rtp.value("address", std::string());
+    const int latency_ms = params.value("latency_ms", 200);
+
+    GstElement* src = MakeElement("udpsrc", nullptr);
+    if (src) {
+      g_object_set(src, "port", port, nullptr);
+      // 고비트레이트(예: 4K) UDP는 SO_RCVBUF가 작으면 버스트 손실이 난다. 수신 버퍼를 16MB로.
+      if (g_object_class_find_property(G_OBJECT_GET_CLASS(src), "buffer-size"))
+        g_object_set(src, "buffer-size", 16 * 1024 * 1024, nullptr);
+      if (!address.empty()) {  // 멀티캐스트 그룹이면 join
+        g_object_set(src, "address", address.c_str(), nullptr);
+        if (g_object_class_find_property(G_OBJECT_GET_CLASS(src), "auto-multicast"))
+          g_object_set(src, "auto-multicast", TRUE, nullptr);
+      }
+    }
+    L.decode = MakeElement("decodebin", nullptr);
+    g_signal_connect(L.decode, "pad-added", G_CALLBACK(OnLiveSourcePadAdded), s);
+
+    if (kind == "udp") {
+      // 순수 UDP: caps 미지정 → decodebin 타입파인드가 컨테이너/코덱을 자동 감지(MPEG-TS 등).
+      if (!src || !L.decode) {
+        feedback_("error", "set_window_source: udp elements unavailable");
+        gst_object_unref(L.bin);
+        L.bin = nullptr;
+        return false;
+      }
+      gst_bin_add_many(GST_BIN(L.bin), src, L.decode, nullptr);
+      if (!gst_element_link(src, L.decode)) {
+        feedback_("error", "set_window_source: udp chain link failed");
+        gst_object_unref(L.bin);
+        L.bin = nullptr;
+        return false;
+      }
+    } else {
+      // RTP: encoding=AUTO(또는 미지정)면 decodebin이 페이로드 타입으로 depay+디코더를 자동
+      // 선택(VLC의 MP2T/pt33 포함). 명시 인코딩이면 해당 depay를 고정한다.
+      std::string enc = rtp.value("encoding_name", std::string("AUTO"));
+      {
+        std::string u;
+        for (char c : enc) u += (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+        enc.swap(u);
+      }
+      const int payload = rtp.value("payload", 96);
+      const int clock_rate = rtp.value("clock_rate", 90000);
+      const std::string media = rtp.value("media", std::string("video"));
+      const bool auto_mode = enc.empty() || enc == "AUTO";
+      const char* depayf = auto_mode ? nullptr : RtpDepayFor(enc);
+      if (!auto_mode && !depayf) {
+        feedback_("error", "set_window_source: unsupported rtp encoding: " + enc);
+        gst_object_unref(L.bin);
+        L.bin = nullptr;
+        return false;
+      }
+      if (src) {
+        // AUTO는 encoding-name/payload를 caps에 넣지 않아 decodebin이 pt로 depay를 고른다.
+        GstCaps* caps = gst_caps_new_simple("application/x-rtp", "media", G_TYPE_STRING,
+                                            media.c_str(), "clock-rate", G_TYPE_INT, clock_rate,
+                                            nullptr);
+        if (!auto_mode)
+          gst_caps_set_simple(caps, "encoding-name", G_TYPE_STRING, enc.c_str(), "payload",
+                              G_TYPE_INT, payload, nullptr);
+        g_object_set(src, "caps", caps, nullptr);
+        gst_caps_unref(caps);
+      }
+      GstElement* jitter = MakeElement("rtpjitterbuffer", nullptr);
+      if (jitter) g_object_set(jitter, "latency", (guint)std::max(0, latency_ms), nullptr);
+      GstElement* depay = auto_mode ? nullptr : MakeElement(depayf, nullptr);
+      if (!src || !jitter || !L.decode || (!auto_mode && !depay)) {
+        feedback_("error", "set_window_source: rtp elements unavailable");
+        gst_object_unref(L.bin);
+        L.bin = nullptr;
+        return false;
+      }
+      if (auto_mode) {
+        gst_bin_add_many(GST_BIN(L.bin), src, jitter, L.decode, nullptr);
+        if (!gst_element_link_many(src, jitter, L.decode, nullptr)) {
+          feedback_("error", "set_window_source: rtp chain link failed");
+          gst_object_unref(L.bin);
+          L.bin = nullptr;
+          return false;
+        }
+      } else {
+        gst_bin_add_many(GST_BIN(L.bin), src, jitter, depay, L.decode, nullptr);
+        if (!gst_element_link_many(src, jitter, depay, L.decode, nullptr)) {
+          feedback_("error", "set_window_source: rtp chain link failed");
+          gst_object_unref(L.bin);
+          L.bin = nullptr;
+          return false;
+        }
+      }
+    }
+  } else if (kind == "ndi") {
+    // NDI: ndisrc(ndi-name 또는 url-address) ! ndisrcdemux → raw video/audio pad(디코드 불요).
+    // NDI 런타임 DLL 부재 시 change_state에서 "Failed loading NDI SDK" 에러 → source_status error.
+    GstElement* src = MakeElement("ndisrc", nullptr);
+    L.decode = MakeElement("ndisrcdemux", nullptr);  // pad-added 소스 (video/audio 분리)
+    if (!src || !L.decode) {
+      feedback_("error", "set_window_source: ndi elements unavailable (plugin missing)");
+      gst_object_unref(L.bin);
+      L.bin = nullptr;
+      return false;
+    }
+    const std::string ndi_name = params.value("ndi_name", std::string());
+    const std::string url = params.value("url_address", std::string());
+    if (!ndi_name.empty()) g_object_set(src, "ndi-name", ndi_name.c_str(), nullptr);
+    if (!url.empty()) g_object_set(src, "url-address", url.c_str(), nullptr);
+    g_signal_connect(L.decode, "pad-added", G_CALLBACK(OnLiveSourcePadAdded), s);
+    gst_bin_add_many(GST_BIN(L.bin), src, L.decode, nullptr);
+    if (!gst_element_link(src, L.decode)) {
+      feedback_("error", "set_window_source: ndi chain link failed");
+      gst_object_unref(L.bin);
+      L.bin = nullptr;
+      return false;
+    }
+  } else {
+    feedback_("error", "set_window_source: unsupported kind: " + kind);
+    gst_object_unref(L.bin);
+    L.bin = nullptr;
+    return false;
+  }
+
+  gst_bin_add(GST_BIN(pipeline_), L.bin);
+  gst_element_sync_state_with_parent(L.bin);
+  gst_bin_recalculate_latency(GST_BIN(pipeline_));
+
+  L.active = true;
+  EmitSourceStatus(s, reconnect ? "reconnecting" : "connecting", nullptr);
+
+  // 재연결 워치독: 스톨/끊김(마지막 버퍼 후 8s 무입력) 감지 → 소스 bin 재빌드.
+  L.watchdog = g_timeout_add(
+      3000,
+      [](gpointer data) -> gboolean {
+        auto* s = static_cast<Surface*>(data);
+        if (!s->live.active) {
+          s->live.watchdog = 0;
+          return G_SOURCE_REMOVE;
+        }
+        const gint64 idle_ms = (g_get_monotonic_time() - s->live.last_buffer_us) / 1000;
+        if (idle_ms > 8000) {
+          s->live.watchdog = 0;  // 재빌드가 새 워치독을 만든다 (자기 제거 회피)
+          s->core->feedback_("warn",
+                             "live source stalled — reconnecting (win " + std::to_string(s->id) + ")");
+          s->live.state = "reconnecting";
+          s->core->RebuildLiveSource(s);
+          return G_SOURCE_REMOVE;
+        }
+        return G_SOURCE_CONTINUE;
+      },
+      s);
+  return true;
+}
+
+void PlayerCore::TeardownLiveSource(Surface* s) {
+  auto& L = s->live;
+  if (L.watchdog) {
+    g_source_remove(L.watchdog);
+    L.watchdog = 0;
+  }
+  if (!L.bin) {
+    L.active = false;
+    return;
+  }
+  // 데드락 방지: NULL 전에 comp/amix에서 먼저 분리 (TeardownDeck과 동일 규약).
+  if (L.comp_pad) {
+    if (L.video_ghost) gst_pad_unlink(L.video_ghost, L.comp_pad);
+    if (s->comp) gst_element_release_request_pad(s->comp, L.comp_pad);
+    gst_object_unref(L.comp_pad);
+    L.comp_pad = nullptr;
+  }
+  if (L.amix_pad) {
+    if (L.audio_ghost) gst_pad_unlink(L.audio_ghost, L.amix_pad);
+    gst_element_release_request_pad(amix_, L.amix_pad);
+    gst_object_unref(L.amix_pad);
+    L.amix_pad = nullptr;
+  }
+  if (L.buffer_probe && L.video_out) {
+    gst_pad_remove_probe(L.video_out, L.buffer_probe);
+    L.buffer_probe = 0;
+  }
+  if (L.video_block && L.video_out) {
+    gst_pad_remove_probe(L.video_out, L.video_block);
+    L.video_block = 0;
+  }
+  if (L.audio_block && L.audio_out) {
+    gst_pad_remove_probe(L.audio_out, L.audio_block);
+    L.audio_block = 0;
+  }
+  gst_element_set_locked_state(L.bin, TRUE);
+  gst_element_set_state(L.bin, GST_STATE_NULL);
+  if (L.video_out) {
+    gst_object_unref(L.video_out);
+    L.video_out = nullptr;
+  }
+  if (L.audio_out) {
+    gst_object_unref(L.audio_out);
+    L.audio_out = nullptr;
+  }
+  gst_bin_remove(GST_BIN(pipeline_), L.bin);
+  L.bin = nullptr;
+  L.decode = nullptr;
+  L.video_tail = nullptr;
+  L.audio_tail = nullptr;
+  L.video_ghost = nullptr;
+  L.audio_ghost = nullptr;
+  L.active = false;
+  L.got_first = false;
+}
+
+void PlayerCore::RebuildLiveSource(Surface* s) {
+  json p = s->live.params;  // Teardown 전에 복사 (Build이 params를 재대입)
+  if (!p.is_object() || p.empty()) return;
+  BuildLiveSource(s, p, /*reconnect=*/true);
+}
+
+void PlayerCore::SetWindowSource(const json& params, int window_id) {
+  Surface* s = GetSurface(window_id);
+  if (!s) {
+    feedback_("error", "set_window_source: no such window: " + std::to_string(window_id));
+    return;
+  }
+  s->live.state.clear();
+  BuildLiveSource(s, params, /*reconnect=*/false);
+}
+
+void PlayerCore::ClearWindowSource(int window_id) {
+  Surface* s = GetSurface(window_id);
+  if (!s || !s->live.active) return;
+  const int wid = s->id;
+  const std::string kind = s->live.kind;
+  TeardownLiveSource(s);
+  s->live.params = json::object();
+  s->live.kind.clear();
+  s->live.state = "cleared";
+  s->media_wants_logo = (s->live_deck < 0);  // 라이브 제거 후 재생 없으면 로고 규칙 복귀
+  UpdateLogoVisibility(s, /*emit_feedback=*/true);
+  feedback_("source_status", json{{"window_id", wid}, {"kind", kind}, {"state", "cleared"}});
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,9 +2529,10 @@ void PlayerCore::ApplyVideoGeometry(Surface* s) {
   const int W = s->aspect_target_w > 0 ? s->aspect_target_w : kCanvasWidth;
   const int H = s->aspect_target_h > 0 ? s->aspect_target_h : kCanvasHeight;
 
+  const double canvas_ar = static_cast<double>(kCanvasWidth) / kCanvasHeight;
   if (s->aspect_mode == "crop") {
+    // 커버(cover): 캔버스 비율을 유지하되 창을 꽉 채우도록 넘치게 렌더(상하 또는 좌우 잘림).
     g_object_set(s->vsink, "force-aspect-ratio", TRUE, nullptr);
-    const double canvas_ar = static_cast<double>(kCanvasWidth) / kCanvasHeight;
     int rw, rh;
     if (static_cast<double>(W) / H > canvas_ar) {
       rw = W;
@@ -2062,12 +2544,31 @@ void PlayerCore::ApplyVideoGeometry(Surface* s) {
     const int rx = (W - rw) / 2;
     const int ry = (H - rh) / 2;
     gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(s->vsink), rx, ry, rw, rh);
+  } else if (s->aspect_mode == "letterbox") {
+    // 레터박스: 캔버스(16:9)를 창 안쪽의 비율맞춤 사각형에만 렌더한다. 남는 띠는 싱크가 칠하는
+    // 검정이 아니라 창 배경색(WM_ERASEBKGND, SetBackgroundColor로 갱신)이 보이게 된다.
+    // (기존엔 force-aspect-ratio=TRUE로 싱크가 검정 띠를 그려 배경색이 안 먹고 "테두리가 남는" 문제.)
+    int rw, rh;
+    if (static_cast<double>(W) / H > canvas_ar) {  // 창이 더 넓음 → 좌우 띠(pillarbox)
+      rh = H;
+      rw = static_cast<int>(H * canvas_ar + 0.5);
+    } else {  // 창이 더 높음 → 상하 띠(letterbox)
+      rw = W;
+      rh = static_cast<int>(W / canvas_ar + 0.5);
+    }
+    const int rx = (W - rw) / 2;
+    const int ry = (H - rh) / 2;
+    gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(s->vsink), rx, ry, rw, rh);
+    // 렌더 사각형이 이미 캔버스 비율과 동일하므로 싱크 내부 레터박스는 불필요(꽉 채움).
+    g_object_set(s->vsink, "force-aspect-ratio", FALSE, nullptr);
   } else {
+    // fill/stretch: 비율 무시하고 창 전체를 채움.
     gst_video_overlay_set_render_rectangle(GST_VIDEO_OVERLAY(s->vsink), 0, 0, W, H);
-    g_object_set(s->vsink, "force-aspect-ratio", s->aspect_mode == "letterbox" ? TRUE : FALSE,
-                 nullptr);
+    g_object_set(s->vsink, "force-aspect-ratio", FALSE, nullptr);
   }
   gst_video_overlay_expose(GST_VIDEO_OVERLAY(s->vsink));
+  // 렌더 사각형 밖(띠)에 남은 이전 프레임을 창 배경색으로 다시 칠하게 강제.
+  s->window.Invalidate();
 }
 
 namespace {
@@ -2288,6 +2789,11 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, boo
     for (auto& [id, t] : audio_tracks_) {
       if (t && t->amix_pad)
         SetPadMatrix(t->amix_pad, t->branch_channels, output_channels_, t->channel_routes);
+    }
+    for (auto& [id, s] : surfaces_) {  // 라이브 입력 레이어 오디오도 새 버스 채널수로 재매핑
+      if (s->live.amix_pad)
+        SetPadMatrix(s->live.amix_pad, s->live.branch_channels, output_channels_,
+                     s->live.channel_routes);
     }
     RebuildDelayRings();  // 출력 채널수 변경 → 지연 링버퍼 재구성 (delays 유지)
   }

@@ -221,6 +221,11 @@ void HandleCommand(const json& msg) {
   } else if (cmd == "set_deck_audio") {
     // 활성 덱(임베디드 오디오) 라이브 라우팅/볼륨/뮤트
     core.SetDeckAudio(msg, wid);
+  } else if (cmd == "set_window_source") {
+    // 창 귀속 라이브 입력 소스 (RTP/RTSP/SRT) — 덱과 독립된 지속 레이어
+    core.SetWindowSource(msg.value("source", json::object()), wid);
+  } else if (cmd == "clear_window_source") {
+    core.ClearWindowSource(wid);
   } else if (cmd == "playlist_mode") {
     core.SetPlaylistMode(msg.value("value", false));
     SendFeedback("debug", "ack: playlist_mode");
@@ -327,6 +332,8 @@ gboolean OnMemoryTick(gpointer) {
   return G_SOURCE_CONTINUE;
 }
 
+bool HasNdiRuntime();  // 정의는 아래 — SendReady보다 뒤라 전방 선언
+
 gboolean SendReady(gpointer) {
   // 클라이언트 연결 전 발송은 유실됨 (SendLine은 미연결 시 무시) — 연결될 때까지
   // 500ms 주기로 재시도. PROTOCOL.md §4가 경고한 ready 레이스의 실제 해소 지점.
@@ -334,13 +341,13 @@ gboolean SendReady(gpointer) {
   SendFeedback("info", "Player ready");
   // v2 기능 협상 (§5): 호스트는 이 목록으로 신규 명령 송신을 게이트 — 구버전 조합에서도
   // 안전하게 강하 (v1 호스트는 모르는 피드백 type을 경고 후 무시)
-  SendFeedback("capabilities",
-               json{{"features",
-                     json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
-                                  "display", "timeline", "multi_window", "track_delay",
-                                  "memory_status", "ptp_sync", "net_clock", "channel_delay",
-                                  "play_synced", "preload_status", "hwaccel", "hw_only",
-                                  "master_volume"})}});
+  json features = json::array({"channel_map", "audio_track", "live_routing", "embedded_streams",
+                               "display", "timeline", "multi_window", "track_delay",
+                               "memory_status", "ptp_sync", "net_clock", "channel_delay",
+                               "play_synced", "preload_status", "hwaccel", "hw_only",
+                               "master_volume", "live_source"});
+  if (HasNdiRuntime()) features.push_back("live_ndi");  // NDI 런타임 설치된 경우에만
+  SendFeedback("capabilities", json{{"features", features}});
   // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음).
   // mode: hw_only(GPU 전용·폴백없음) / on(HW+SW폴백) / off(SW강제).
   SendFeedback("hwaccel_status",
@@ -350,6 +357,31 @@ gboolean SendReady(gpointer) {
                     {"render", g_app->core.UsesD3d11() ? "d3d11" : "software"},
                     {"decode", g_app->core.HwAccelEnabled() ? "hardware" : "software"}});
   return G_SOURCE_REMOVE;
+}
+
+// ---------- NDI 런타임 감지 ----------
+// NDI 플러그인(ndisrc)은 번들 GStreamer에 있으나, 독점 NDI 런타임 DLL은 별도 설치가 필요하다
+// (라이선스상 미번들). 플러그인 존재 + 런타임 DLL 로드 가능해야 실사용 가능 → live_ndi 능력 게이트.
+bool HasNdiRuntime() {
+  GstElementFactory* f = gst_element_factory_find("ndisrc");
+  if (!f) return false;  // 플러그인 자체가 없음
+  gst_object_unref(f);
+  const char* dll = "Processing.NDI.Lib.x64.dll";
+  HMODULE h = LoadLibraryA(dll);  // PATH 탐색
+  if (!h) {
+    for (const char* var : {"NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5"}) {
+      const char* dir = getenv(var);
+      if (!dir || !*dir) continue;
+      std::string p = std::string(dir) + "\\" + dll;
+      h = LoadLibraryA(p.c_str());
+      if (h) break;
+    }
+  }
+  if (h) {
+    FreeLibrary(h);
+    return true;
+  }
+  return false;
 }
 
 // ---------- 하드웨어 가속 토글 ----------

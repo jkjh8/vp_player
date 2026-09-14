@@ -36,6 +36,8 @@ $pluginNames = @(
   'audioconvert','audioresample','audiomixer','volume','wasapi2','audiotestsrc',
   # 컨테이너/파서
   'isomp4','matroska','avi','wavparse','audioparsers','videoparsersbad','id3demux','ogg',
+  # 라이브 입력 스트림 (RTP/RTSP/SRT — 창 귀속 라이브 소스, 전부 LGPL)
+  'udp','rtp','rtpmanager','rtsp','srt','mpegtsdemux',
   # 코덱 (mediafoundation = OS HW/SW, libav = "뭐든 재생" 폴백)
   'mediafoundation','libav','jpeg','png','mpg123','opus','vorbis','flac'
 )

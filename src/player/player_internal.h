@@ -138,6 +138,46 @@ struct PlayerCore::AudioTrack {
 };
 
 // ---------------------------------------------------------------------------
+// LiveSource — 창에 귀속된 라이브 입력 레이어 (RTP/RTSP/SRT/NDI). A/B 덱·풀과 독립된 상주
+// 컴포지터 패드(zorder 1 = 배경 위, 덱 아래). Stop/StopAll이 덱만 해체하므로 플레이리스트
+// 재생/정지와 무관하게 유지되고, 창 파괴(DestroySurface/프리셋 전환)에서만 해체된다.
+// 프리롤/시크/EOS-전환 경로에 얹지 않는다(라이브 = 무한·무시크). 오디오는 전역 amix로.
+// ---------------------------------------------------------------------------
+struct PlayerCore::LiveSource {
+  bool active = false;
+  std::string kind;       // "rtsp" | "rtp" | "srt" | "ndi"
+  nlohmann::json params;  // set_window_source 원본 (재연결 재빌드용)
+
+  GstElement* bin = nullptr;     // 소스 체인 bin
+  GstElement* decode = nullptr;  // uridecodebin3(rtsp/srt) 또는 decodebin(rtp) — pad-added 소스
+
+  GstElement* video_tail = nullptr;  // convert (comp 링크 원본)
+  GstPad* video_out = nullptr;       // convert:src (정적)
+  GstPad* video_ghost = nullptr;
+  GstPad* comp_pad = nullptr;  // comp sink_%u (zorder 1)
+  gulong video_block = 0;      // 링크 전 데이터 홀드 (pad-added↔메인 링크 레이스 방지)
+  gulong buffer_probe = 0;     // 스톨 감지 + 첫 버퍼 → playing 전환
+
+  GstElement* audio_tail = nullptr;  // volume
+  GstPad* audio_out = nullptr;
+  GstPad* audio_ghost = nullptr;
+  GstPad* amix_pad = nullptr;
+  gulong audio_block = 0;
+  std::vector<ChannelRoute> channel_routes;
+  int branch_channels = 2;
+  double volume_gain = 1.0;
+  bool master_muted = false;
+  bool has_audio = false;
+
+  std::string state;  // "connecting" | "playing" | "reconnecting" | "error" | "cleared"
+  std::atomic<bool> got_first{false};
+  gint64 last_buffer_us = 0;  // g_get_monotonic_time() (스톨 감지 — 스트리밍 스레드 기록)
+  guint watchdog = 0;
+  bool codec_error = false;
+  bool resource_error = false;
+};
+
+// ---------------------------------------------------------------------------
 // Surface — 창 1개 단위 (comp/vsink/듀얼덱/배경/로고). 오디오는 전역 버스 공유.
 // ---------------------------------------------------------------------------
 struct PlayerCore::Surface {
@@ -166,6 +206,9 @@ struct PlayerCore::Surface {
   // 재생 명령 시 pool에서 경로가 일치하는 덱을 즉시 승격(swap)해 지연 없이 전환한다.
   std::vector<nlohmann::json> sequence;
   std::vector<std::unique_ptr<Deck>> pool;
+
+  // 라이브 입력 레이어 (창 귀속 지속 소스 — 덱/풀과 독립, comp zorder 1). 플레이리스트와 무관.
+  LiveSource live;
 
   // 로고 오버레이 상태 (창별)
   GstElement* logo_src = nullptr;

@@ -108,6 +108,10 @@ void VideoWindow::SetBackgroundColor(uint32_t rgb) {
   if (hwnd_) InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
+void VideoWindow::Invalidate() {
+  if (hwnd_) InvalidateRect(hwnd_, nullptr, TRUE);
+}
+
 void VideoWindow::ApplyPlacement(const WindowPlacement& placement) {
   if (!hwnd_) return;
   auto* copy = new WindowPlacement(placement);

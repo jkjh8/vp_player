@@ -24,8 +24,9 @@ namespace vp {
 // 토폴로지 (플랜 "듀얼 덱 + 컴포지터" 확정안 — Phase 1에서 멀티 서피스로 확장):
 //   [공유 파이프라인, 시스템/PTP 클록 1개]
 //   창(Surface)별:
-//     [bg] videotestsrc(solid-color, live) ─ d3d11upload ─▶ comp.sink (zorder 0)
-//     [deck 0/1] uridecodebin3 ─ video: queue!d3d11upload!d3d11convert ─▶ comp.sink (zorder 1+id)
+//     [bg]   videotestsrc(solid-color, live) ─ d3d11upload ─▶ comp.sink (zorder 0)
+//     [live] rtsp/rtp/srt 소스 ─ decode ─ convert ─▶ comp.sink (zorder 1) — 창 귀속 지속 레이어
+//     [deck 0/1] uridecodebin3 ─ video: queue!d3d11upload!d3d11convert ─▶ comp.sink (zorder 2+id)
 //     [logo] appsrc(RGBA) ─▶ comp.sink (zorder 100)
 //     d3d11compositor ─▶ d3d11videosink (창 HWND, GstVideoOverlay)
 //   전역 오디오 버스 (모든 창의 모든 덱이 공유):
@@ -141,6 +142,16 @@ class PlayerCore {
   // 활성 덱(임베디드 오디오)의 라우팅/볼륨/뮤트 라이브 변경. msg={channel_map?,volume?,muted?}.
   void SetDeckAudio(const nlohmann::json& msg, int window_id = 0);
 
+  // ---- 라이브 입력 소스 (창 귀속 지속 레이어) ---------------------------------
+  // 창에 라이브 스트림(RTP/RTSP/SRT)을 붙인다(이미 붙어있으면 교체). A/B 덱·프리롤 풀과
+  // 독립된 상주 컴포지터 패드(zorder 1 = 배경 위, 덱 아래)로, 플레이리스트 재생/정지(Stop은
+  // 덱만 해체)와 무관하게 유지되며 창 파괴(DestroySurface/프리셋 전환) 시에만 해체된다.
+  // 프리롤/시크/EOS-전환에 얹지 않는다(라이브 = 무한·무시크). 오디오는 전역 amix로.
+  //  params: {kind:'rtsp'|'rtp'|'srt', uri?, rtp:{address,port,encoding_name,payload,clock_rate,
+  //           media}?, latency_ms?, has_audio?, channel_map?, volume?, muted?}
+  void SetWindowSource(const nlohmann::json& params, int window_id = 0);
+  void ClearWindowSource(int window_id = 0);
+
   // 레거시 호환 경로 (프로토콜 §2) + prev/next 폴백 — 주 창(0) 기준
   void SetPlaylistMode(bool on) { playlist_mode_ = on; }
   void SetTracks(const nlohmann::json& tracks);
@@ -191,6 +202,7 @@ class PlayerCore {
   struct AudioTrack;
   struct Surface;  // 창 1개 단위 (comp/vsink/듀얼덱/배경/로고). 정의는 .cpp.
   struct SyncGroup;  // play_synced 배리어 (정의는 player_internal.h).
+  struct LiveSource;  // 창 귀속 라이브 입력 레이어 (정의는 player_internal.h).
 
   // 타임라인 컴파일 결과 (플레인 데이터).
   struct TlClip {
@@ -291,6 +303,19 @@ class PlayerCore {
   // 오디오 sink 열기 실패 시 무음 fakesink로 교체 — 파이프라인/영상이 멈추지 않게 함.
   void FallbackAudioSink();
   void ApplyDeckRouting(Deck* deck);
+
+  // ---- 라이브 소스 (창 귀속 지속 레이어) ----
+  // params로 소스 체인(rtsp/srt=uridecodebin3, rtp=udpsrc!jitter!depay!decodebin)을 만들어
+  // 창 comp(zorder 1)/전역 amix에 상주 링크. reconnect=true면 재연결(상태 표시용).
+  bool BuildLiveSource(Surface* s, const nlohmann::json& params, bool reconnect);
+  void TeardownLiveSource(Surface* s);
+  void RebuildLiveSource(Surface* s);  // params 유지 재빌드 (스톨/오류 재연결)
+  void LinkLiveVideo(Surface* s);      // pad-added가 빌드한 비디오 브랜치를 comp에 링크 (메인)
+  void LinkLiveAudio(Surface* s);      // 오디오 브랜치를 amix에 링크 (메인)
+  static void OnLiveSourcePadAdded(GstElement*, GstPad* pad, gpointer user_data);  // user_data=Surface*
+  static void OnLiveSourceSetup(GstElement*, GstElement* source, gpointer user_data);
+  Surface* SurfaceForLiveObject(GstObject* obj);  // 버스 메시지 src가 속한 라이브 bin의 창
+  void EmitSourceStatus(Surface* s, const char* state, const char* reason);
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static void OnAudioTrackPadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);

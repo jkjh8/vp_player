@@ -51,6 +51,7 @@ class VideoWindow {
   void SetFullscreen(bool fullscreen);
   bool IsFullscreen() const { return fullscreen_; }
   void SetBackgroundColor(uint32_t rgb);  // 0xRRGGBB — 비디오 없을 때의 창 배경
+  void Invalidate();  // 클라이언트 영역 다시 칠하기 요청 (레터박스 띠를 배경색으로 갱신)
   void ApplyPlacement(const WindowPlacement& placement);  // 라이브 재배치 (모니터/좌표/크기)
 
   // 현재 배치된 클라이언트 영역 크기 (aspect-ratio 계산 등에 사용)
