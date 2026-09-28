@@ -2020,8 +2020,15 @@ bool PlayerCore::PoolPrerollIndex(Surface* s, int seq_idx) {
   const json& f = s->sequence[seq_idx];
   const std::string path = f.value("path", "");
   if (path.empty()) return true;
+  // 아직 재생 전인 스탠바이 덱(Building/Prerolled)만 커버로 인정한다. 라이브·재생 끝난 덱은
+  // 같은 파일이어도 재사용 불가 — 플레이리스트에 같은 영상이 중복되면(예: 2=A, 3=B, 4=A)
+  // 끝난 2번 덱을 4번 커버로 오인해 프리롤을 건너뛰고, 3번 종료 시 next가 "no preloaded
+  // deck"으로 실패해 재생이 멈췄다.
   for (const auto& d : s->decks) {
-    if (d && d->file.value("path", std::string()) == path) return true;  // 라이브/스탠바이 커버
+    if (d && d->id != s->live_deck &&
+        (d->state == Deck::State::Building || d->state == Deck::State::Prerolled) &&
+        d->file.value("path", std::string()) == path)
+      return true;
   }
   if (PoolFindByPath(s, path) >= 0) return true;  // 이미 풀에 있음
   if (CountPrerollDecks() >= preload_max_decks_) {
