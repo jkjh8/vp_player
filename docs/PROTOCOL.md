@@ -899,8 +899,31 @@ sink)는 전역 공유** — 전 창의 모든 덱이 하나의 amix로 믹스�
 - `create_window {window_id, monitor_index?, x?, y?, width?, height?, aspect_mode?, z_order?}`
   창을 동적 생성(테두리 없는 borderless Win32 창 + comp/vsink/배경/로고). 주 창(0)은 부팅 시
   자동 생성됨. `z_order`(기본 0)는 창이 겹칠 때 쌓임 순서 — 값이 클수록 앞(위).
+- **오디오 전용 창:** `create_window`에 `audio_only: true`(capability `audio_only_window`)를 실으면 Win32 창·
+  comp/vsink/배경/로고를 만들지 않는 **화면 송출 없는 창**이 된다. 덱은 디코드 단계에서 비오디오 스트림을
+  선택 해제(`select-stream`)해 영상 디코드 비용이 없고, 오디오만 전역 버스(amix)로 나간다. 재생 명령·
+  `end_reached`·`set_deck_audio`(채널맵)는 일반 창과 동일. 오디오 스트림이 없는 미디어(영상 전용/이미지)는
+  즉시 `playback_error{reason:"no_audio_stream"}`. 배치/배경/풀스크린/로고 명령은 무시(무해).
+  라이브 소스를 귀속하면 오디오만 재생(영상은 폐기). `windows` 목록 항목에 `audio_only` 표시.
+- 비디오가 없는 미디어(오디오 파일)는 창 종류와 무관하게 **오디오 EOS로 `end_reached`**를 보고한다.
+- **고정 모니터 식별:** `get_displays`의 각 항목에 `key`(DisplayConfig monitorDevicePath — 같은 포트면 재부팅에도
+  불변)·`name`(EDID 표시 이름)·`serial`(EDID 시리얼)이 실린다. `index`는 순번(primary→좌표순)이라 늦게 켜지는
+  모니터/배치 변경 시 밀리므로 영속 식별자로 쓰지 말 것. `create_window`/`set_display`에 `monitor_key`
+  (+폴백 `monitor_serial`)를 실으면 key → serial(유일할 때만) 순으로 모니터를 찾고 `monitor_index`는 무시한다.
+  대상 모니터가 없으면 주 모니터로 옮기지 않고 **창을 숨긴 채 대기**(`windows[].monitor_connected:false`).
+  플레이어는 2초 주기로 모니터 구성을 감시해 변경 시 `displays`를 다시 보내고 전 창 배치를 재해석한다
+  (모니터가 돌아오면 자동 표시).
+- **창별 오디오 디바이스:** `create_window`에 `audio_device`(get_audio_devices의 deviceId, capability
+  `window_audio_device`)를 실으면 그 창의 덱/라이브 입력/창 귀속 오디오 트랙이 해당 디바이스 버스로 출력된다.
+  같은 디바이스 창끼리 버스 공유, 미지정·전역과 같은 값 = main 버스(`set_audio_device`). 생성 시 고정 — 변경은
+  창 재생성. ASIO는 동시에 1개만(충돌 시 error + main 폴백). 채널 지연(`set_channel_delays`)은 main 버스에만,
+  마스터 볼륨은 전 버스. `audio_track_play`에 `window_id`를 실으면 그 창의 버스/뮤트를 따른다.
+  `windows` 항목에 `audio_device`·`audio_channels`, `memory_status`에 `audio_buses`.
+- **창 오디오 뮤트:** `set_window_mute {window_id, muted}`(capability `window_mute`) — 그 창의 덱·라이브 입력·
+  창 귀속 오디오 트랙을 amix 패드 mute로 즉시 뮤트/해제(이후 재생에도 유지). `create_window`에 `muted:true`로
+  생성 시 적용 가능. 응답 `window_mute {window_id, muted}`, `windows` 항목에 `muted`.
 - `destroy_window {window_id}` 창 해체 (해당 창의 덱/풀 정리 + 창 파괴).
-- `get_windows` → `P→H {"type":"windows","data":{"windows":[{window_id,aspect_mode,width,height,z_order,fullscreen}, ...]}}`
+- `get_windows` → `P→H {"type":"windows","data":{"windows":[{window_id,aspect_mode,width,height,z_order,fullscreen,audio_only}, ...]}}`
 - 창 생성/삭제 응답도 `windows` 피드백으로 최신 목록을 함께 보낸다(`created`/`destroyed` 키 포함).
 - **z-order:** `create_window`/`set_display`에 `z_order`가 실리면 전 창을 `z_order` 내림차순(앞→뒤)으로
   재적층한다(Win32 `SetWindowPos` 체인). 겹치는 창의 레이어/PIP 합성 순서를 정한다. 풀스크린 창은

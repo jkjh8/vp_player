@@ -73,17 +73,15 @@ class PlayerCore {
 
   // ---- 창(Surface) 생명주기 -------------------------------------------------
   // 창 생성: 자체 Win32 창 + comp/vsink/배경/로고 브랜치를 공유 파이프라인에 추가.
+  // audio_only=true면 창/비디오 그래프 없이 오디오만 재생하는 서피스(화면 송출 없음).
   bool CreateSurface(int window_id, const WindowPlacement& placement,
-                     const std::string& aspect_mode = "letterbox");
+                     const std::string& aspect_mode = "letterbox", bool audio_only = false,
+                     const std::string& audio_device = std::string());
   void DestroySurface(int window_id);
   bool HasSurface(int window_id) const { return surfaces_.count(window_id) > 0; }
   // 기본 대상 창 id — 주 창 개념 폐지 후 window_id 미지정 명령의 라우팅 대상.
-  // 창 0이 있으면 0, 없으면 존재하는 첫 창, 아무 창도 없으면 0.
-  int DefaultWindowId() const {
-    if (surfaces_.count(0)) return 0;
-    if (!surfaces_.empty()) return surfaces_.begin()->first;
-    return 0;
-  }
+  // 창 0(비디오)이 있으면 0, 없으면 가장 낮은 id의 비디오 창 → 아무 창 → 0. 오디오 전용 창은 후순위.
+  int DefaultWindowId() const;
   nlohmann::json ListSurfaces() const;  // get_windows 피드백용
   // 엔진 통계 (memory_status 피드백용): 창/라이브덱/프리롤덱/오디오트랙 수
   nlohmann::json EngineStats() const;
@@ -94,6 +92,8 @@ class PlayerCore {
   void SetWindowZOrder(int window_id, int z_order);
   // 전 창을 z_order 내림차순(앞→뒤)으로 SetWindowPos 체인 재배치. 풀스크린(TOPMOST) 창은 제외.
   void RestackWindows();
+  // 모니터 구성 변경(연결/분리/재배치) 시 전 창의 배치를 다시 해석 — 대상 모니터가 돌아오면 표시.
+  void RefreshPlacements();
 
   // ---- 재생 (window_id 기본 0 = 주 창, 하위호환) -----------------------------
   // file: 호스트가 주는 file 객체 (path 필수). image_time_s: 이미지 표시 시간(초, 0=무한).
@@ -141,6 +141,8 @@ class PlayerCore {
   void SetChannelDelays(const nlohmann::json& delays);
   // 활성 덱(임베디드 오디오)의 라우팅/볼륨/뮤트 라이브 변경. msg={channel_map?,volume?,muted?}.
   void SetDeckAudio(const nlohmann::json& msg, int window_id = 0);
+  // 창 오디오 전체 뮤트 (그 창의 덱/라이브 입력/창 귀속 오디오 트랙). 즉시 적용, 이후 재생에도 유지.
+  void SetWindowMute(int window_id, bool muted);
 
   // ---- 라이브 입력 소스 (창 귀속 지속 레이어) ---------------------------------
   // 창에 라이브 스트림(RTP/RTSP/SRT)을 붙인다(이미 붙어있으면 교체). A/B 덱·프리롤 풀과
@@ -200,6 +202,7 @@ class PlayerCore {
  private:
   struct Deck;
   struct AudioTrack;
+  struct AudioBus;   // 출력 디바이스 1개 = 믹서 1개 (정의는 player_internal.h)
   struct Surface;  // 창 1개 단위 (comp/vsink/듀얼덱/배경/로고). 정의는 .cpp.
   struct SyncGroup;  // play_synced 배리어 (정의는 player_internal.h).
   struct LiveSource;  // 창 귀속 라이브 입력 레이어 (정의는 player_internal.h).
@@ -299,10 +302,21 @@ class PlayerCore {
   bool DeckPrerolled(Surface* s, int slot) const;
 
   // 오디오 버스 라우팅
-  void DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned);
+  void DoAudioSinkSwap(AudioBus* bus, const std::string& device_id, int channels, bool positioned);
   // 오디오 sink 열기 실패 시 무음 fakesink로 교체 — 파이프라인/영상이 멈추지 않게 함.
-  void FallbackAudioSink();
+  void FallbackAudioSink(AudioBus* bus);
   void ApplyDeckRouting(Deck* deck);
+  // ---- 오디오 버스 (창별 출력 디바이스) ----
+  // 디바이스 → 버스 채널수/포지셔닝 (ASIO = 드라이버 채널수, WASAPI = 2~8). 사용 불가면 false.
+  bool ResolveDeviceChannels(const std::string& device_id, int* channels, bool* positioned);
+  GstElement* MakeAudioSink(const std::string& device_id, const std::string& name);
+  bool BuildAudioBus(AudioBus* bus);
+  void TeardownAudioBus(AudioBus* bus);
+  // 창 디바이스 → 버스 (빈 값/전역과 같음 = main, 그 외 디바이스 버스 생성·공유). ASIO는 동시 1개.
+  AudioBus* AcquireBus(const std::string& device_id);
+  void ReleaseBusIfUnused(AudioBus* bus);  // 창/트랙 참조가 없으면 디바이스 버스 해체
+  AudioBus* BusForElement(GstObject* obj);  // 버스 메시지 src → 소속 버스 (sink 오류 폴백용)
+  void RematrixBus(AudioBus* bus);          // 버스 채널수 변경 → 그 버스 소스 전부 mix-matrix 재적용
 
   // ---- 라이브 소스 (창 귀속 지속 레이어) ----
   // params로 소스 체인(rtsp/srt=uridecodebin3, rtp=udpsrc!jitter!depay!decodebin)을 만들어
@@ -318,30 +332,27 @@ class PlayerCore {
   void EmitSourceStatus(Surface* s, const char* state, const char* reason);
 
   static void OnDecodePadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
+  static GstPadProbeReturn OnDeckEosProbe(GstPad* pad, GstPadProbeInfo* info, gpointer user_data);
+  static gint OnDecodeSelectStream(GstElement* dbin, GstStreamCollection* collection,
+                                   GstStream* stream, gpointer user_data);
   static void OnAudioTrackPadAdded(GstElement* dbin, GstPad* pad, gpointer user_data);
   static GstBusSyncReply OnBusSync(GstBus* bus, GstMessage* msg, gpointer user_data);
   static gboolean OnBusMessage(GstBus* bus, GstMessage* msg, gpointer user_data);
   // 출력 채널별 지연 라인 (bus_caps src 패드 버퍼 프로브 — 인터리브 F32LE in-place)
   static GstPadProbeReturn OnBusAudioProbe(GstPad*, GstPadProbeInfo*, gpointer);
-  void RebuildDelayRings();  // output_channels_ 기준 링버퍼 재구성 (delays 유지) — 락 획득
+  void RebuildDelayRings();  // main 버스 채널수 기준 링버퍼 재구성 (delays 유지) — 락 획득
 
   FeedbackFn feedback_;
   SurfaceClosedFn on_surface_closed_;
 
   GstElement* pipeline_ = nullptr;
-  // 전역 오디오 버스 (모든 창 공유)
-  GstElement* amix_ = nullptr;       // audiomixer
-  GstElement* bus_caps_ = nullptr;   // amix 직후 출력 capsfilter (버스 채널수 정책 지점)
-  GstElement* audio_tail_ = nullptr; // 출력단 audioresample (sink 교체 시 재연결 지점)
-  GstElement* audio_sink_ = nullptr; // wasapi2sink/asiosink (폴백: autoaudiosink)
-  GstElement* master_vol_ = nullptr; // 출력단 전역 마스터 볼륨 (amix 이후 최종 volume)
-  double master_volume_ = 1.0;       // 0~1 (UI 0~100)
+  // 오디오 출력 버스. main = 전역 디바이스(모든 창 기본). 창별 디바이스는 device_buses_(디바이스 id 키).
+  std::unique_ptr<AudioBus> main_bus_;
+  std::map<std::string, std::unique_ptr<AudioBus>> device_buses_;
+  int bus_seq_ = 0;                  // 디바이스 버스 요소 이름 고유화
+  double master_volume_ = 1.0;       // 0~1 (UI 0~100) — 전 버스 공통
   bool hwaccel_enabled_ = true;      // HW 가속 요청 (Init 전 SetHardwareAcceleration로 설정)
   bool hw_only_ = false;             // HW 전용 디코드 (소프트웨어 비디오 폴백 없음)
-  bool audio_fallback_active_ = false;  // sink 열기 실패로 fakesink 대체 중 (디바이스 재선택 시 해제)
-  GstPad* silence_pad_ = nullptr;    // 무음 앵커의 amix 요청 패드 (matrix 갱신 지점)
-  int output_channels_ = 2;          // 오디오 버스 채널수 (디바이스 추종)
-  bool bus_positioned_ = true;       // true = fallback mask, false = unpositioned(asio)
   bool use_d3d11_ = true;
 
   // 출력 채널별 지연 라인 (스트리밍 스레드 프로브 ↔ 메인 스레드 설정 — 뮤텍스 보호)

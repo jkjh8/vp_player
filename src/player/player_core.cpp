@@ -197,6 +197,17 @@ PlayerCore::Surface* PlayerCore::GetSurface(int window_id) {
   auto it = surfaces_.find(window_id);
   return it == surfaces_.end() ? nullptr : it->second.get();
 }
+// window_id 미지정 명령/타임라인의 대상 창. 화면 송출 창을 우선(오디오 전용 창으로 영상 명령이
+// 가지 않도록) — 0번 → 가장 낮은 id의 비디오 창 → 아무 창 순.
+int PlayerCore::DefaultWindowId() const {
+  auto it0 = surfaces_.find(0);
+  if (it0 != surfaces_.end() && !it0->second->audio_only) return 0;
+  for (const auto& [id, s] : surfaces_)
+    if (!s->audio_only) return id;
+  if (!surfaces_.empty()) return surfaces_.begin()->first;
+  return 0;
+}
+
 const PlayerCore::Surface* PlayerCore::GetSurface(int window_id) const {
   auto it = surfaces_.find(window_id);
   return it == surfaces_.end() ? nullptr : it->second.get();
@@ -223,30 +234,6 @@ bool PlayerCore::Init(FeedbackFn feedback) {
     feedback_("info", "hardware acceleration disabled — software render/decode");
   }
 
-  amix_ = MakeElement("audiomixer", "amix");
-  bus_caps_ = MakeElement("capsfilter", "bus_caps");
-  {
-    GstCaps* caps = MakeBusCaps(output_channels_, bus_positioned_);
-    g_object_set(bus_caps_, "caps", caps, nullptr);
-    gst_caps_unref(caps);
-  }
-  GstElement* aconv = MakeElement("audioconvert", "aconv_out");
-  GstElement* ares = MakeElement("audioresample", "ares_out");
-  // 전역 마스터 볼륨 (출력 최종단, 전 소스 합산 후). sink 교체와 무관하게 유지되도록 ares 뒤,
-  // sink 앞에 고정. sink 교체는 audio_tail_↔sink를 언링크/재링크하므로 audio_tail_ = master_vol_.
-  master_vol_ = MakeElement("volume", "master_vol");
-  audio_tail_ = master_vol_;
-  if (master_vol_) g_object_set(master_vol_, "volume", master_volume_, nullptr);
-  audio_sink_ = MakeElement("wasapi2sink", "asink");
-  if (!audio_sink_) {
-    audio_sink_ = MakeElement("autoaudiosink", "asink");
-    feedback_("warn", "wasapi2sink unavailable — falling back to autoaudiosink");
-  }
-  if (!amix_ || !bus_caps_ || !aconv || !ares || !master_vol_ || !audio_sink_) {
-    feedback_("error", "audio bus elements unavailable");
-    return false;
-  }
-
   // 시스템 클록 고정 (멀티 PC PTP 전환의 교체 지점 — Phase 5).
   {
     GstClock* sysclock = gst_system_clock_obtain();
@@ -254,42 +241,10 @@ bool PlayerCore::Init(FeedbackFn feedback) {
     gst_object_unref(sysclock);
   }
 
-  // 무음 앵커 (덱이 없어도 오디오 클록/믹서 유지)
-  GstElement* silence = MakeElement("audiotestsrc", "silence");
-  g_object_set(silence, "wave", 4 /* silence */, "is-live", TRUE, nullptr);
-  GstElement* silence_caps = MakeElement("capsfilter", "silence_caps");
-  {
-    GstCaps* caps = MakeBranchCaps(1);
-    g_object_set(silence_caps, "caps", caps, nullptr);
-    gst_caps_unref(caps);
-  }
-  GstElement* silence_conv = MakeElement("audioconvert", "silence_conv");
-
-  gst_bin_add_many(GST_BIN(pipeline_), amix_, bus_caps_, aconv, ares, master_vol_, audio_sink_,
-                   silence, silence_conv, silence_caps, nullptr);
-
-  if (!gst_element_link_many(amix_, bus_caps_, aconv, ares, master_vol_, audio_sink_, nullptr)) {
-    feedback_("error", "failed to link audio output stage");
-    return false;
-  }
-  // 출력 채널별 지연 라인 — bus_caps 출력(Nch F32LE 인터리브)에 in-place 프로브. 기본 패스스루.
-  {
-    GstPad* bp = gst_element_get_static_pad(bus_caps_, "src");
-    gst_pad_add_probe(bp, GST_PAD_PROBE_TYPE_BUFFER, OnBusAudioProbe, this, nullptr);
-    gst_object_unref(bp);
-  }
-  {
-    gst_element_link_many(silence, silence_conv, silence_caps, nullptr);
-    GstPad* src = gst_element_get_static_pad(silence_caps, "src");
-    silence_pad_ = gst_element_request_pad_simple(amix_, "sink_%u");
-    bool ok = gst_pad_link(src, silence_pad_) == GST_PAD_LINK_OK;
-    gst_object_unref(src);
-    if (!ok) {
-      feedback_("error", "failed to link silence branch");
-      return false;
-    }
-    SetPadMatrix(silence_pad_, 1, output_channels_, {-1});
-  }
+  // main 오디오 버스 (전역 디바이스 — 기본 wasapi2sink, set_audio_device로 교체)
+  main_bus_ = std::make_unique<AudioBus>();
+  main_bus_->is_main = true;
+  if (!BuildAudioBus(main_bus_.get())) return false;
 
   GstBus* bus = gst_element_get_bus(pipeline_);
   gst_bus_set_sync_handler(bus, OnBusSync, this, nullptr);
@@ -304,11 +259,208 @@ bool PlayerCore::Init(FeedbackFn feedback) {
 }
 
 // ---------------------------------------------------------------------------
+// 오디오 버스 (출력 디바이스별 믹서)
+// ---------------------------------------------------------------------------
+
+GstElement* PlayerCore::MakeAudioSink(const std::string& device_id, const std::string& name) {
+  GstElement* sink = nullptr;
+  if (device_id.rfind("asio:", 0) == 0) {
+    sink = MakeElementN("asiosink", name);
+    if (sink)
+      g_object_set(sink, "device-clsid", device_id.substr(5).c_str(), "occupy-all-channels", FALSE,
+                   nullptr);
+  } else {
+    sink = MakeElementN("wasapi2sink", name);
+    if (sink && !device_id.empty()) g_object_set(sink, "device", device_id.c_str(), nullptr);
+  }
+  if (!sink) {
+    sink = MakeElementN("autoaudiosink", name);
+    feedback_("warn", "audio sink unavailable for " + (device_id.empty() ? std::string("default") : device_id) +
+                          " — falling back to autoaudiosink");
+  }
+  return sink;
+}
+
+bool PlayerCore::BuildAudioBus(AudioBus* b) {
+  const std::string& x = b->sfx;
+  b->amix = MakeElementN("audiomixer", "amix" + x);
+  b->caps = MakeElementN("capsfilter", "bus_caps" + x);
+  GstElement* aconv = MakeElementN("audioconvert", "aconv_out" + x);
+  GstElement* ares = MakeElementN("audioresample", "ares_out" + x);
+  // 마스터 볼륨 (출력 최종단, 전 소스 합산 후). sink 교체는 vol↔sink만 언링크/재링크.
+  b->vol = MakeElementN("volume", "master_vol" + x);
+  b->sink = MakeAudioSink(b->device_id, "asink" + x);
+  // 무음 앵커 (소스가 없어도 오디오 클록/믹서 유지)
+  GstElement* silence = MakeElementN("audiotestsrc", "silence" + x);
+  GstElement* silence_conv = MakeElementN("audioconvert", "silence_conv" + x);
+  GstElement* silence_caps = MakeElementN("capsfilter", "silence_caps" + x);
+  if (!b->amix || !b->caps || !aconv || !ares || !b->vol || !b->sink || !silence ||
+      !silence_conv || !silence_caps) {
+    feedback_("error", "audio bus elements unavailable");
+    return false;
+  }
+  {
+    GstCaps* caps = MakeBusCaps(b->channels, b->positioned);
+    g_object_set(b->caps, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+  }
+  g_object_set(b->vol, "volume", master_volume_, nullptr);
+  g_object_set(silence, "wave", 4 /* silence */, "is-live", TRUE, nullptr);
+  {
+    GstCaps* caps = MakeBranchCaps(1);
+    g_object_set(silence_caps, "caps", caps, nullptr);
+    gst_caps_unref(caps);
+  }
+
+  GstElement* all[] = {b->amix, b->caps,  aconv,        ares,        b->vol,
+                       b->sink, silence, silence_conv, silence_caps};
+  for (GstElement* e : all) gst_bin_add(GST_BIN(pipeline_), e);
+
+  if (!gst_element_link_many(b->amix, b->caps, aconv, ares, b->vol, b->sink, nullptr)) {
+    feedback_("error", "failed to link audio output stage");
+    return false;
+  }
+  // 출력 채널별 지연 라인 — main 버스 bus_caps 출력(Nch F32LE 인터리브)에 in-place 프로브.
+  if (b->is_main) {
+    GstPad* bp = gst_element_get_static_pad(b->caps, "src");
+    gst_pad_add_probe(bp, GST_PAD_PROBE_TYPE_BUFFER, OnBusAudioProbe, this, nullptr);
+    gst_object_unref(bp);
+  }
+  {
+    gst_element_link_many(silence, silence_conv, silence_caps, nullptr);
+    GstPad* src = gst_element_get_static_pad(silence_caps, "src");
+    b->silence_pad = gst_element_request_pad_simple(b->amix, "sink_%u");
+    const bool ok = gst_pad_link(src, b->silence_pad) == GST_PAD_LINK_OK;
+    gst_object_unref(src);
+    if (!ok) {
+      feedback_("error", "failed to link silence branch");
+      return false;
+    }
+    SetPadMatrix(b->silence_pad, 1, b->channels, {-1});
+  }
+  // 실행 중 파이프라인에 추가한 디바이스 버스는 상태 동기 + 지연 재계산 (Init 시엔 무해한 no-op)
+  for (GstElement* e : all) gst_element_sync_state_with_parent(e);
+  if (!b->is_main) gst_bin_recalculate_latency(GST_BIN(pipeline_));
+  return true;
+}
+
+void PlayerCore::TeardownAudioBus(AudioBus* b) {
+  if (b->silence_pad && b->amix) {
+    gst_element_release_request_pad(b->amix, b->silence_pad);
+    gst_object_unref(b->silence_pad);
+    b->silence_pad = nullptr;
+  }
+  const std::string& x = b->sfx;
+  const std::string names[] = {"silence" + x,   "silence_conv" + x, "silence_caps" + x,
+                               "asink" + x,     "master_vol" + x,   "ares_out" + x,
+                               "aconv_out" + x, "bus_caps" + x,     "amix" + x};
+  for (const auto& n : names) {
+    if (GstElement* e = gst_bin_get_by_name(GST_BIN(pipeline_), n.c_str())) {
+      gst_element_set_locked_state(e, TRUE);
+      gst_element_set_state(e, GST_STATE_NULL);
+      gst_bin_remove(GST_BIN(pipeline_), e);
+      gst_object_unref(e);
+    }
+  }
+  b->amix = b->caps = b->vol = b->sink = nullptr;
+}
+
+bool PlayerCore::ResolveDeviceChannels(const std::string& device_id, int* channels,
+                                       bool* positioned) {
+  const bool is_asio = device_id.rfind("asio:", 0) == 0;
+  int ch = 0;
+  if (!device_id.empty()) {
+    for (const auto& d : ListAudioDevices()) {
+      if (d.value("deviceId", std::string()) == device_id) {
+        ch = d.value("channels", 0);
+        break;
+      }
+    }
+  }
+  if (is_asio && ch < 1) return false;  // ASIO = 드라이버 보고 채널수 고정 (없으면 사용 불가)
+  *positioned = !is_asio;
+  *channels = is_asio ? ch : std::clamp(ch, 2, 8);
+  return true;
+}
+
+PlayerCore::AudioBus* PlayerCore::AcquireBus(const std::string& device_id) {
+  AudioBus* main = main_bus_.get();
+  if (device_id.empty() || device_id == main->device_id) return main;
+  if (auto it = device_buses_.find(device_id); it != device_buses_.end()) return it->second.get();
+
+  // ASIO는 프로세스당 드라이버 1개만 안정적으로 열린다 → 이미 다른 ASIO를 쓰는 버스가 있으면 거부.
+  if (device_id.rfind("asio:", 0) == 0) {
+    bool asio_busy = main->device_id.rfind("asio:", 0) == 0;
+    for (const auto& [id, b] : device_buses_) asio_busy |= id.rfind("asio:", 0) == 0;
+    if (asio_busy) {
+      feedback_("error", "window audio device: only one ASIO device can be used at a time — " +
+                             device_id + " falls back to the main device");
+      return main;
+    }
+  }
+  auto bus = std::make_unique<AudioBus>();
+  bus->device_id = device_id;
+  bus->sfx = "_b" + std::to_string(++bus_seq_);
+  if (!ResolveDeviceChannels(device_id, &bus->channels, &bus->positioned)) {
+    feedback_("error", "window audio device not available: " + device_id +
+                           " — falls back to the main device");
+    return main;
+  }
+  if (!BuildAudioBus(bus.get())) {
+    TeardownAudioBus(bus.get());
+    return main;
+  }
+  feedback_("info", "window audio bus opened: " + device_id + " (" +
+                        std::to_string(bus->channels) + "ch)");
+  AudioBus* raw = bus.get();
+  device_buses_[device_id] = std::move(bus);
+  return raw;
+}
+
+void PlayerCore::ReleaseBusIfUnused(AudioBus* b) {
+  if (!b || b->is_main) return;
+  for (const auto& [id, s] : surfaces_)
+    if (s && s->bus == b) return;
+  for (const auto& [id, t] : audio_tracks_)
+    if (t && t->bus == b) return;
+  const std::string dev = b->device_id;
+  TeardownAudioBus(b);
+  device_buses_.erase(dev);
+  feedback_("debug", "window audio bus closed: " + dev);
+}
+
+PlayerCore::AudioBus* PlayerCore::BusForElement(GstObject* obj) {
+  auto owns = [obj](AudioBus* b) {
+    return b && b->sink &&
+           (obj == GST_OBJECT(b->sink) || gst_object_has_as_ancestor(obj, GST_OBJECT(b->sink)));
+  };
+  if (owns(main_bus_.get())) return main_bus_.get();
+  for (auto& [id, b] : device_buses_)
+    if (owns(b.get())) return b.get();
+  return nullptr;
+}
+
+void PlayerCore::RematrixBus(AudioBus* b) {
+  if (b->silence_pad) SetPadMatrix(b->silence_pad, 1, b->channels, {-1});
+  for (auto& [id, s] : surfaces_) {
+    if (s->bus != b) continue;
+    for (auto& d : s->decks)
+      if (d && d->amix_pad) ApplyDeckRouting(d.get());
+    if (s->live.amix_pad)  // 라이브 입력 레이어 오디오도 새 버스 채널수로 재매핑
+      SetPadMatrix(s->live.amix_pad, s->live.branch_channels, b->channels, s->live.channel_routes);
+  }
+  for (auto& [id, t] : audio_tracks_)
+    if (t && t->bus == b && t->amix_pad)
+      SetPadMatrix(t->amix_pad, t->branch_channels, b->channels, t->channel_routes);
+}
+
+// ---------------------------------------------------------------------------
 // 서피스(창) 생성 / 해체
 // ---------------------------------------------------------------------------
 
 bool PlayerCore::CreateSurface(int window_id, const WindowPlacement& placement,
-                               const std::string& aspect_mode) {
+                               const std::string& aspect_mode, bool audio_only,
+                               const std::string& audio_device) {
   if (surfaces_.count(window_id)) {
     feedback_("warn", "create_window: window already exists: " + std::to_string(window_id));
     return true;
@@ -318,6 +470,15 @@ bool PlayerCore::CreateSurface(int window_id, const WindowPlacement& placement,
   s->core = this;
   s->id = window_id;
   s->aspect_mode = aspect_mode;
+  s->audio_only = audio_only;
+  s->bus = AcquireBus(audio_device);  // 창별 출력 디바이스 (미지정 = main)
+
+  // 오디오 전용: 창·비디오 그래프 없음. 덱 오디오는 전역 amix로 가므로 서피스는 덱 컨테이너 역할만.
+  if (audio_only) {
+    surfaces_[window_id] = std::move(surf);
+    feedback_("debug", "audio-only window created: " + std::to_string(window_id));
+    return true;
+  }
 
   // 창 생성 (핸들러는 창 스레드 → 메인 마샬링). window_id를 캡처해 피드백에 반사.
   PlayerCore* self = this;
@@ -347,12 +508,14 @@ bool PlayerCore::CreateSurface(int window_id, const WindowPlacement& placement,
       });
   if (!ok) {
     feedback_("error", "create_window: failed to create window " + std::to_string(window_id));
+    ReleaseBusIfUnused(s->bus);  // 아직 surfaces_에 없으므로 이 창 몫은 미사용으로 판정
     return false;
   }
   s->hwnd = s->window.hwnd();
 
   if (!BuildSurfaceGraph(s)) {
     s->window.Destroy();
+    ReleaseBusIfUnused(s->bus);
     feedback_("error", "create_window: failed to build graph " + std::to_string(window_id));
     return false;
   }
@@ -476,7 +639,9 @@ void PlayerCore::DestroySurface(int window_id) {
   if (!s) return;
   TeardownSurfaceGraph(s);
   s->window.Destroy();
+  AudioBus* bus = s->bus;
   surfaces_.erase(window_id);
+  ReleaseBusIfUnused(bus);  // 이 창만 쓰던 디바이스 버스 해체
   feedback_("debug", "window destroyed: " + std::to_string(window_id));
 }
 
@@ -488,7 +653,13 @@ json PlayerCore::ListSurfaces() const {
                    {"width", s->window.client_width()},
                    {"height", s->window.client_height()},
                    {"z_order", s->z_order},
-                   {"fullscreen", s->window.IsFullscreen()}});
+                   {"fullscreen", s->window.IsFullscreen()},
+                   {"audio_only", s->audio_only},
+                   {"audio_device", s->bus ? s->bus->device_id : std::string()},
+                   {"audio_channels", s->bus ? s->bus->channels : 2},
+                   {"muted", s->muted},
+                   // 대상 모니터(monitor_key) 미연결로 숨김 대기 중이면 false
+                   {"monitor_connected", s->audio_only || !s->window.IsDetached()}});
   }
   return arr;
 }
@@ -510,16 +681,24 @@ json PlayerCore::EngineStats() const {
               {"live_decks", live},
               {"prerolled_decks", prerolled},
               {"pool_decks", pool},
-              {"audio_tracks", static_cast<int>(audio_tracks_.size())}};
+              {"audio_tracks", static_cast<int>(audio_tracks_.size())},
+              {"audio_buses", 1 + static_cast<int>(device_buses_.size())}};
 }
 
 void PlayerCore::SetMasterVolume(double volume) {
   master_volume_ = std::clamp(volume, 0.0, 100.0) / 100.0;
-  if (master_vol_) g_object_set(master_vol_, "volume", master_volume_, nullptr);
+  if (main_bus_ && main_bus_->vol) g_object_set(main_bus_->vol, "volume", master_volume_, nullptr);
+  for (auto& [id, b] : device_buses_)
+    if (b->vol) g_object_set(b->vol, "volume", master_volume_, nullptr);
 }
 
 void PlayerCore::ApplyDisplayPlacement(const WindowPlacement& placement, int window_id) {
   if (Surface* s = GetSurface(window_id)) s->window.ApplyPlacement(placement);
+}
+
+void PlayerCore::RefreshPlacements() {
+  for (auto& [id, s] : surfaces_)
+    if (s && s->hwnd) s->window.Reresolve();
 }
 
 void PlayerCore::SetFullscreen(bool fullscreen, int window_id) {
@@ -640,7 +819,7 @@ void PlayerCore::UpdateLogoVisibility(Surface* s, bool emit_feedback) {
 
 void PlayerCore::SetLogoFile(const std::string& path, int window_id) {
   Surface* s = GetSurface(window_id);
-  if (!s) return;
+  if (!s || !s->logo_src) return;  // 오디오 전용 창은 로고 브랜치 없음
   std::string ext = std::filesystem::path(path).extension().string();
   for (auto& c : ext) c = static_cast<char>(tolower(c));
 
@@ -714,9 +893,13 @@ void PlayerCore::Shutdown() {
   for (int id : ids) DestroySurface(id);
 
   gst_element_set_state(pipeline_, GST_STATE_NULL);
-  if (silence_pad_) {
-    gst_object_unref(silence_pad_);
-    silence_pad_ = nullptr;
+  if (main_bus_ && main_bus_->silence_pad) {
+    gst_object_unref(main_bus_->silence_pad);
+    main_bus_->silence_pad = nullptr;
+  }
+  for (auto& [id, b] : device_buses_) {
+    if (b->silence_pad) gst_object_unref(b->silence_pad);
+    b->silence_pad = nullptr;
   }
   if (ptp_clock_) {
     gst_object_unref(ptp_clock_);
@@ -724,6 +907,8 @@ void PlayerCore::Shutdown() {
   }
   gst_object_unref(pipeline_);
   pipeline_ = nullptr;
+  device_buses_.clear();
+  main_bus_.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +975,14 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
       GstObject* src_obj = GST_MESSAGE_SRC(msg);
       std::string src = GST_OBJECT_NAME(src_obj);
       const std::string emsg = err ? err->message : "unknown";
+      // 오디오 전용 창의 무오디오 미디어: 전 스트림 해제에 따른 예상된 decodebin 오류 —
+      // playback_error{no_audio_stream}로 따로 보고하므로 일반 error 피드백은 생략.
+      Deck* src_deck = self->DeckForObject(src_obj);
+      if (src_deck && src_deck->no_audio) {
+        if (err) g_error_free(err);
+        g_free(dbg);
+        break;
+      }
       self->feedback_("error", "pipeline error from " + src + ": " + emsg);
 
       // 코덱/디코더 부재 (HW 전용 모드에서 GPU가 못 여는 코덱 = 소프트웨어 폴백 강등됨).
@@ -808,7 +1001,11 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
                    err->code == GST_RESOURCE_ERROR_OPEN_READ_WRITE ||
                    err->code == GST_RESOURCE_ERROR_BUSY ||
                    err->code == GST_RESOURCE_ERROR_NOT_FOUND));
-      if (from_asink || resource_open) self->FallbackAudioSink();
+      if (from_asink || resource_open) {
+        // 오류 낸 sink의 버스만 폴백 (다른 디바이스 버스는 계속 출력). 못 찾으면 main.
+        AudioBus* ab = self->BusForElement(src_obj);
+        self->FallbackAudioSink(ab ? ab : self->main_bus_.get());
+      }
       // 실패 원인을 해당 덱에 힌트로 표시 (CheckPreroll이 playback_error reason 결정에 사용).
       if (codec_err || (resource_open && !from_asink)) {
         if (Deck* d = self->DeckForObject(src_obj)) {
@@ -861,6 +1058,45 @@ gboolean PlayerCore::OnBusMessage(GstBus*, GstMessage* msg, gpointer user_data) 
 // 덱 빌드 / 프리롤
 // ---------------------------------------------------------------------------
 
+// 덱 EOS → end_reached (스트리밍 스레드에서 호출, 메인 마샬). 비디오가 있으면 비디오 EOS만,
+// 없으면(오디오 전용 미디어/오디오 전용 창) 오디오 EOS로 보고한다. eos_sent 래치로 1회.
+GstPadProbeReturn PlayerCore::OnDeckEosProbe(GstPad* pad, GstPadProbeInfo* info,
+                                             gpointer user_data) {
+  auto* d = static_cast<Deck*>(user_data);
+  if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) != GST_EVENT_EOS) return GST_PAD_PROBE_OK;
+  if (pad == d->audio_out && d->video_out) return GST_PAD_PROBE_OK;  // 비디오 EOS가 담당
+  if (d->state == Deck::State::Live && !d->eos_sent && !d->core->timeline_active_) {
+    d->eos_sent = true;
+    PlayerCore* c = d->core;
+    const int track = d->track_idx;
+    const int id = d->id;
+    const int wid = d->surface ? d->surface->id : 0;
+    InvokeOnMain([c, track, id, wid] {
+      c->feedback_("end_reached", json{{"playlist_track_index", track},
+                                       {"active_player_id", id},
+                                       {"window_id", wid}});
+    });
+  }
+  return GST_PAD_PROBE_OK;
+}
+
+// 오디오 전용 창: 비오디오 스트림(비디오/이미지/자막)을 디코드 전에 선택 해제 → 디코드 비용 0.
+// 컬렉션에 오디오가 하나도 없으면 no_audio 표시(CheckPreroll이 즉시 playback_error로 보고).
+// 일반 창은 -1(기본 선택) 그대로.
+gint PlayerCore::OnDecodeSelectStream(GstElement*, GstStreamCollection* collection,
+                                      GstStream* stream, gpointer user_data) {
+  auto* deck = static_cast<Deck*>(user_data);
+  if (!deck->surface || !deck->surface->audio_only) return -1;
+  bool has_audio = false;
+  for (guint i = 0; i < gst_stream_collection_get_size(collection); ++i) {
+    if (gst_stream_get_stream_type(gst_stream_collection_get_stream(collection, i)) &
+        GST_STREAM_TYPE_AUDIO)
+      has_audio = true;
+  }
+  if (!has_audio) deck->no_audio = true;
+  return (gst_stream_get_stream_type(stream) & GST_STREAM_TYPE_AUDIO) ? 1 : 0;
+}
+
 void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) {
   auto* deck = static_cast<Deck*>(user_data);
   PlayerCore* core = deck->core;
@@ -872,7 +1108,8 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
   const bool is_audio = g_str_has_prefix(name, "audio/");
   gst_caps_unref(caps);
 
-  if (is_video && !deck->video_tail) {
+  // 오디오 전용 창에선 비디오를 받지 않는다(select-stream으로 이미 해제 — 방어적 무시).
+  if (is_video && !deck->video_tail && !(deck->surface && deck->surface->audio_only)) {
     GstElement* q = MakeElement("queue", nullptr);
     GstElement* freeze = deck->is_image ? MakeElement("imagefreeze", nullptr) : nullptr;
     GstElement* freeze_caps = nullptr;
@@ -924,26 +1161,8 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
     gst_element_sync_state_with_parent(convert);
     if (!ok) InvokeOnMain([core] { core->feedback_("error", "deck: video branch link failed"); });
 
-    gst_pad_add_probe(
-        deck->video_out, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
-        [](GstPad*, GstPadProbeInfo* info, gpointer user_data) -> GstPadProbeReturn {
-          auto* d = static_cast<Deck*>(user_data);
-          if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) == GST_EVENT_EOS &&
-              d->state == Deck::State::Live && !d->eos_sent && !d->core->timeline_active_) {
-            d->eos_sent = true;
-            PlayerCore* c = d->core;
-            const int track = d->track_idx;
-            const int id = d->id;
-            const int wid = d->surface ? d->surface->id : 0;
-            InvokeOnMain([c, track, id, wid] {
-              c->feedback_("end_reached", json{{"playlist_track_index", track},
-                                               {"active_player_id", id},
-                                               {"window_id", wid}});
-            });
-          }
-          return GST_PAD_PROBE_OK;
-        },
-        deck, nullptr);
+    gst_pad_add_probe(deck->video_out, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, OnDeckEosProbe, deck,
+                      nullptr);
   } else if (is_audio && !deck->audio_tail) {
     GstElement* q = MakeElement("queue", nullptr);
     GstElement* conv = MakeElement("audioconvert", nullptr);
@@ -974,6 +1193,9 @@ void PlayerCore::OnDecodePadAdded(GstElement*, GstPad* pad, gpointer user_data) 
           return GST_PAD_PROBE_OK;
         },
         deck, nullptr);
+    // 비디오 없는 미디어(오디오 파일 / 오디오 전용 창)의 트랙 종료 보고
+    gst_pad_add_probe(deck->audio_out, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, OnDeckEosProbe, deck,
+                      nullptr);
 
     gst_element_sync_state_with_parent(q);
     gst_element_sync_state_with_parent(conv);
@@ -1023,6 +1245,8 @@ std::unique_ptr<PlayerCore::Deck> PlayerCore::ConstructDeck(Surface* s, int id, 
   deck->decode = MakeElement("uridecodebin3", nullptr);
   g_object_set(deck->decode, "uri", uri->c_str(), nullptr);
   g_signal_connect(deck->decode, "pad-added", G_CALLBACK(OnDecodePadAdded), deck.get());
+  if (s->audio_only)
+    g_signal_connect(deck->decode, "select-stream", G_CALLBACK(OnDecodeSelectStream), deck.get());
   gst_bin_add(GST_BIN(deck->bin), deck->decode);
 
   gst_bin_add(GST_BIN(pipeline_), deck->bin);
@@ -1073,6 +1297,13 @@ void PlayerCore::SwapWithDelay(Deck* deck) {
 
 bool PlayerCore::CheckPreroll(Deck* deck) {
   Surface* s = deck->surface;
+  // 오디오 전용 창에 오디오 없는 미디어(영상 전용/이미지). 전 스트림 해제로 decodebin3가 상태 전환
+  // 실패를 내므로 그보다 먼저 판정해 정확한 reason으로 보고한다.
+  if (deck->no_audio) {
+    EmitPlaybackError(deck, "no_audio_stream");
+    TeardownDeck(deck);
+    return false;
+  }
   GstState state = GST_STATE_NULL;
   if (gst_element_get_state(deck->bin, &state, nullptr, 0) == GST_STATE_CHANGE_FAILURE) {
     EmitPlaybackError(deck, "preroll_failed");
@@ -1283,7 +1514,7 @@ void PlayerCore::SwapTo(Deck* deck) {
   const GstClockTime offset =
       deck->start_at_rt >= 0 ? static_cast<GstClockTime>(deck->start_at_rt) : RunningTime();
 
-  if (deck->video_out) {
+  if (deck->video_out && s->comp) {
     deck->video_ghost = gst_ghost_pad_new("video_src", deck->video_out);
     gst_pad_set_active(deck->video_ghost, TRUE);
     gst_element_add_pad(deck->bin, deck->video_ghost);
@@ -1303,7 +1534,8 @@ void PlayerCore::SwapTo(Deck* deck) {
     gst_pad_set_active(deck->audio_ghost, TRUE);
     gst_element_add_pad(deck->bin, deck->audio_ghost);
 
-    deck->amix_pad = gst_element_request_pad_simple(amix_, "sink_%u");
+    deck->amix_pad = gst_element_request_pad_simple(s->bus->amix, "sink_%u");
+    if (s->muted) g_object_set(deck->amix_pad, "mute", TRUE, nullptr);  // 창 뮤트 유지
     ApplyDeckRouting(deck);
     gst_pad_set_offset(deck->audio_out, static_cast<gint64>(offset));
     if (gst_pad_link(deck->audio_ghost, deck->amix_pad) != GST_PAD_LINK_OK) {
@@ -1461,7 +1693,7 @@ void PlayerCore::TeardownDeck(Deck* deck) {
   }
   if (deck->amix_pad) {
     if (deck->audio_ghost) gst_pad_unlink(deck->audio_ghost, deck->amix_pad);
-    gst_element_release_request_pad(amix_, deck->amix_pad);
+    gst_element_release_request_pad((s && s->bus ? s->bus : main_bus_.get())->amix, deck->amix_pad);
     gst_object_unref(deck->amix_pad);
     deck->amix_pad = nullptr;
   }
@@ -1553,7 +1785,17 @@ void PlayerCore::OnLiveSourcePadAdded(GstElement*, GstPad* pad, gpointer user_da
   const bool is_audio = g_str_has_prefix(name, "audio/");
   gst_caps_unref(caps);
 
-  if (is_video && !s->live.video_tail) {
+  if (is_video && s->audio_only) {
+    // 오디오 전용 창: 라이브 영상은 표시하지 않고 버린다(decodebin 패드를 미연결로 두면 not-linked
+    // 오류로 소스 전체가 멈춤). 스톨 감지/playing 전환은 LinkLiveAudio의 오디오 프로브가 담당.
+    GstElement* sink = MakeElement("fakesink", nullptr);
+    g_object_set(sink, "sync", FALSE, "async", FALSE, nullptr);
+    gst_bin_add(GST_BIN(s->live.bin), sink);
+    GstPad* fsink = gst_element_get_static_pad(sink, "sink");
+    gst_pad_link(pad, fsink);
+    gst_object_unref(fsink);
+    gst_element_sync_state_with_parent(sink);
+  } else if (is_video && !s->live.video_tail) {
     GstElement* q = MakeElement("queue", nullptr);
     // 라이브 지터/누적 방지: 오래된 프레임은 버린다(leaky downstream).
     g_object_set(q, "leaky", 2, "max-size-time", (guint64)0, "max-size-bytes", (guint)0,
@@ -1670,14 +1912,32 @@ void PlayerCore::LinkLiveAudio(Surface* s) {
   gst_pad_set_active(L.audio_ghost, TRUE);
   gst_element_add_pad(L.bin, L.audio_ghost);
 
-  L.amix_pad = gst_element_request_pad_simple(amix_, "sink_%u");
-  SetPadMatrix(L.amix_pad, L.branch_channels, output_channels_, L.channel_routes);
+  L.amix_pad = gst_element_request_pad_simple(s->bus->amix, "sink_%u");
+  if (s->muted) g_object_set(L.amix_pad, "mute", TRUE, nullptr);  // 창 뮤트 유지
+  SetPadMatrix(L.amix_pad, L.branch_channels, s->bus->channels, L.channel_routes);
   if (gst_pad_link(L.audio_ghost, L.amix_pad) != GST_PAD_LINK_OK)
     feedback_("error", "live: audio link to mixer failed");
 
   if (L.audio_block) {
     gst_pad_remove_probe(L.audio_out, L.audio_block);
     L.audio_block = 0;
+  }
+  // 오디오 전용 창: 영상 프로브가 없으므로 오디오 버퍼로 스톨 감지 + 첫 버퍼 → playing 전환.
+  if (s->audio_only && !L.buffer_probe) {
+    L.buffer_probe = gst_pad_add_probe(
+        L.audio_out, GST_PAD_PROBE_TYPE_BUFFER,
+        [](GstPad*, GstPadProbeInfo*, gpointer u) -> GstPadProbeReturn {
+          auto* s = static_cast<Surface*>(u);
+          s->live.last_buffer_us = g_get_monotonic_time();
+          if (!s->live.got_first.exchange(true)) {
+            PlayerCore* c = s->core;
+            InvokeOnMain([c, s] {
+              if (s->live.active) c->EmitSourceStatus(s, "playing", nullptr);
+            });
+          }
+          return GST_PAD_PROBE_OK;
+        },
+        s, nullptr);
   }
   gst_bin_recalculate_latency(GST_BIN(pipeline_));
 }
@@ -1894,12 +2154,14 @@ void PlayerCore::TeardownLiveSource(Surface* s) {
   }
   if (L.amix_pad) {
     if (L.audio_ghost) gst_pad_unlink(L.audio_ghost, L.amix_pad);
-    gst_element_release_request_pad(amix_, L.amix_pad);
+    gst_element_release_request_pad(s->bus->amix, L.amix_pad);
     gst_object_unref(L.amix_pad);
     L.amix_pad = nullptr;
   }
-  if (L.buffer_probe && L.video_out) {
-    gst_pad_remove_probe(L.video_out, L.buffer_probe);
+  if (L.buffer_probe) {
+    // 일반 창은 영상 패드, 오디오 전용 창은 오디오 패드에 걸린다
+    GstPad* probed = s->audio_only ? L.audio_out : L.video_out;
+    if (probed) gst_pad_remove_probe(probed, L.buffer_probe);
     L.buffer_probe = 0;
   }
   if (L.video_block && L.video_out) {
@@ -2639,46 +2901,48 @@ json PlayerCore::ListAudioDevices() {
 }
 
 void PlayerCore::SetAudioDevice(const std::string& device_id) {
-  if (!audio_tail_ || !audio_sink_) return;
+  AudioBus* bus = main_bus_.get();
+  if (!bus || !bus->vol || !bus->sink) return;
 
-  const bool is_asio = device_id.rfind("asio:", 0) == 0;
-  int channels = 0;
-  if (!device_id.empty()) {
-    for (const auto& d : ListAudioDevices()) {
-      if (d.value("deviceId", std::string()) == device_id) {
-        channels = d.value("channels", 0);
-        break;
-      }
-    }
-  }
-  if (is_asio && channels < 1) {
+  int channels = 2;
+  bool positioned = true;
+  if (!ResolveDeviceChannels(device_id, &channels, &positioned)) {
     feedback_("error", "set_audio_device: asio device not available: " + device_id);
     return;
   }
-  const bool positioned = !is_asio;
-  if (!is_asio) channels = std::clamp(channels, 2, 8);
+  // ASIO 동시 1개: 창 디바이스 버스가 이미 다른 ASIO를 쓰고 있으면 거부.
+  if (device_id.rfind("asio:", 0) == 0) {
+    for (const auto& [id, b] : device_buses_) {
+      if (id.rfind("asio:", 0) == 0 && id != device_id) {
+        feedback_("error", "set_audio_device: another ASIO device is in use by a window (" + id +
+                               ") — only one ASIO device can be used at a time");
+        return;
+      }
+    }
+  }
 
   struct Ctx {
     PlayerCore* core;
+    AudioBus* bus;
     std::string device;
     int channels;
     bool positioned;
   };
-  auto* ctx = new Ctx{this, device_id, channels, positioned};
+  auto* ctx = new Ctx{this, bus, device_id, channels, positioned};
 
-  GstPad* src = gst_element_get_static_pad(audio_tail_, "src");
+  GstPad* src = gst_element_get_static_pad(bus->vol, "src");
   gst_pad_add_probe(
       src, GST_PAD_PROBE_TYPE_IDLE,
       [](GstPad*, GstPadProbeInfo*, gpointer data) -> GstPadProbeReturn {
         auto* c = static_cast<Ctx*>(data);
-        c->core->DoAudioSinkSwap(c->device, c->channels, c->positioned);
+        c->core->DoAudioSinkSwap(c->bus, c->device, c->channels, c->positioned);
         return GST_PAD_PROBE_REMOVE;
       },
       ctx, [](gpointer data) { delete static_cast<Ctx*>(data); });
   gst_object_unref(src);
 }
 
-// 출력 채널별 지연 링버퍼 재구성 (락 보유 상태에서 호출) — output_channels_ 기준.
+// 출력 채널별 지연 링버퍼 재구성 (락 보유 상태에서 호출) — main 버스 채널수 기준.
 static void RebuildRingsLocked(int out_ch, const std::vector<int>& delay_ms,
                                std::vector<int>& delay_samples,
                                std::vector<std::vector<float>>& rings, std::vector<int>& wpos,
@@ -2705,7 +2969,7 @@ void PlayerCore::SetChannelDelays(const json& delays) {
     for (const auto& v : delays)
       channel_delay_ms_.push_back(v.is_number() ? std::max(0, static_cast<int>(v.get<double>())) : 0);
   }
-  RebuildRingsLocked(output_channels_, channel_delay_ms_, chan_delay_samples_, chan_ring_,
+  RebuildRingsLocked(main_bus_->channels, channel_delay_ms_, chan_delay_samples_, chan_ring_,
                      chan_wpos_, delay_ring_len_, delays_active_);
   int maxms = 0;
   for (int m : channel_delay_ms_) maxms = std::max(maxms, m);
@@ -2715,7 +2979,7 @@ void PlayerCore::SetChannelDelays(const json& delays) {
 
 void PlayerCore::RebuildDelayRings() {
   std::lock_guard<std::mutex> lk(delay_mtx_);
-  RebuildRingsLocked(output_channels_, channel_delay_ms_, chan_delay_samples_, chan_ring_,
+  RebuildRingsLocked(main_bus_->channels, channel_delay_ms_, chan_delay_samples_, chan_ring_,
                      chan_wpos_, delay_ring_len_, delays_active_);
 }
 
@@ -2731,7 +2995,7 @@ GstPadProbeReturn PlayerCore::OnBusAudioProbe(GstPad*, GstPadProbeInfo* info, gp
   if (!gst_buffer_map(buf, &map, GST_MAP_READWRITE)) return GST_PAD_PROBE_OK;
 
   std::lock_guard<std::mutex> lk(self->delay_mtx_);
-  const int N = self->output_channels_;
+  const int N = self->main_bus_->channels;
   if (N <= 0 || static_cast<int>(self->chan_ring_.size()) != N) {
     gst_buffer_unmap(buf, &map);
     return GST_PAD_PROBE_OK;
@@ -2758,72 +3022,52 @@ GstPadProbeReturn PlayerCore::OnBusAudioProbe(GstPad*, GstPadProbeInfo* info, gp
 // 그렇지 않으면 sink가 버퍼를 소비 못 해 amix→덱 오디오 경로가 back-pressure로 막히고,
 // 결국 영상까지 멈춘다("재생되다 멈춤"). fakesink(sync=true)는 클록에 맞춰 소비만 하므로
 // 파이프라인이 계속 흐른다(오디오는 무음). 디바이스 재선택 시 정상 sink로 복귀.
-void PlayerCore::FallbackAudioSink() {
-  if (audio_fallback_active_) return;
-  audio_fallback_active_ = true;
-  gst_element_set_locked_state(audio_sink_, TRUE);
-  gst_element_set_state(audio_sink_, GST_STATE_NULL);
-  gst_element_unlink(audio_tail_, audio_sink_);
-  gst_bin_remove(GST_BIN(pipeline_), audio_sink_);
+void PlayerCore::FallbackAudioSink(AudioBus* bus) {
+  if (!bus || bus->fallback_active) return;
+  bus->fallback_active = true;
+  gst_element_set_locked_state(bus->sink, TRUE);
+  gst_element_set_state(bus->sink, GST_STATE_NULL);
+  gst_element_unlink(bus->vol, bus->sink);
+  gst_bin_remove(GST_BIN(pipeline_), bus->sink);
 
-  audio_sink_ = MakeElement("fakesink", "asink");
-  g_object_set(audio_sink_, "sync", TRUE, "async", FALSE, "silent", TRUE, nullptr);
-  gst_bin_add(GST_BIN(pipeline_), audio_sink_);
-  gst_element_link(audio_tail_, audio_sink_);
-  gst_element_sync_state_with_parent(audio_sink_);
-  feedback_("warn", "audio device could not be opened — running silent (video continues)");
+  bus->sink = MakeElementN("fakesink", "asink" + bus->sfx);
+  g_object_set(bus->sink, "sync", TRUE, "async", FALSE, "silent", TRUE, nullptr);
+  gst_bin_add(GST_BIN(pipeline_), bus->sink);
+  gst_element_link(bus->vol, bus->sink);
+  gst_element_sync_state_with_parent(bus->sink);
+  const std::string label = bus->device_id.empty() ? std::string("default") : bus->device_id;
+  feedback_("warn", "audio device could not be opened (" + label +
+                        ") — running silent (video continues)");
 }
 
-void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, bool positioned) {
-  audio_fallback_active_ = false;  // 사용자가 디바이스를 다시 고르면 폴백 해제
-  gst_element_set_locked_state(audio_sink_, TRUE);
-  gst_element_set_state(audio_sink_, GST_STATE_NULL);
-  gst_element_unlink(audio_tail_, audio_sink_);
-  gst_bin_remove(GST_BIN(pipeline_), audio_sink_);
+// bus의 sink를 device_id로 교체 (IDLE 프로브 = 스트리밍 스레드). 채널수가 바뀌면 그 버스의
+// 소스 전부 mix-matrix 재적용. main 버스면 지연 링버퍼도 재구성.
+void PlayerCore::DoAudioSinkSwap(AudioBus* bus, const std::string& device_id, int channels,
+                                 bool positioned) {
+  bus->fallback_active = false;  // 사용자가 디바이스를 다시 고르면 폴백 해제
+  gst_element_set_locked_state(bus->sink, TRUE);
+  gst_element_set_state(bus->sink, GST_STATE_NULL);
+  gst_element_unlink(bus->vol, bus->sink);
+  gst_bin_remove(GST_BIN(pipeline_), bus->sink);
 
-  if (channels != output_channels_ || positioned != bus_positioned_) {
-    output_channels_ = channels;
-    bus_positioned_ = positioned;
+  bus->device_id = device_id;
+  if (channels != bus->channels || positioned != bus->positioned) {
+    bus->channels = channels;
+    bus->positioned = positioned;
     GstCaps* caps = MakeBusCaps(channels, positioned);
-    g_object_set(bus_caps_, "caps", caps, nullptr);
+    g_object_set(bus->caps, "caps", caps, nullptr);
     gst_caps_unref(caps);
-    if (silence_pad_) SetPadMatrix(silence_pad_, 1, channels, {-1});
-    for (auto& [id, s] : surfaces_) {
-      for (auto& d : s->decks) {
-        if (d && d->amix_pad) ApplyDeckRouting(d.get());
-      }
-    }
-    for (auto& [id, t] : audio_tracks_) {
-      if (t && t->amix_pad)
-        SetPadMatrix(t->amix_pad, t->branch_channels, output_channels_, t->channel_routes);
-    }
-    for (auto& [id, s] : surfaces_) {  // 라이브 입력 레이어 오디오도 새 버스 채널수로 재매핑
-      if (s->live.amix_pad)
-        SetPadMatrix(s->live.amix_pad, s->live.branch_channels, output_channels_,
-                     s->live.channel_routes);
-    }
-    RebuildDelayRings();  // 출력 채널수 변경 → 지연 링버퍼 재구성 (delays 유지)
+    RematrixBus(bus);
+    if (bus->is_main) RebuildDelayRings();  // 출력 채널수 변경 → 지연 링버퍼 재구성 (delays 유지)
   }
 
-  if (device_id.rfind("asio:", 0) == 0) {
-    audio_sink_ = MakeElement("asiosink", "asink");
-    if (audio_sink_) {
-      g_object_set(audio_sink_, "device-clsid", device_id.substr(5).c_str(), "occupy-all-channels",
-                   FALSE, nullptr);
-    }
-  } else {
-    audio_sink_ = MakeElement("wasapi2sink", "asink");
-    if (audio_sink_ && !device_id.empty()) {
-      g_object_set(audio_sink_, "device", device_id.c_str(), nullptr);
-    }
-  }
-  if (!audio_sink_) audio_sink_ = MakeElement("autoaudiosink", "asink");
-  gst_bin_add(GST_BIN(pipeline_), audio_sink_);
-  const bool ok = gst_element_link(audio_tail_, audio_sink_);
-  gst_element_sync_state_with_parent(audio_sink_);
+  bus->sink = MakeAudioSink(device_id, "asink" + bus->sfx);
+  gst_bin_add(GST_BIN(pipeline_), bus->sink);
+  const bool ok = gst_element_link(bus->vol, bus->sink);
+  gst_element_sync_state_with_parent(bus->sink);
 
   const std::string label = device_id.empty() ? "default" : device_id;
-  const int ch = output_channels_;
+  const int ch = bus->channels;
   InvokeOnMain([this, ok, label, ch] {
     if (ok) {
       feedback_("info", "audio device applied: " + label + " (" + std::to_string(ch) + "ch bus)");
@@ -2835,7 +3079,25 @@ void PlayerCore::DoAudioSinkSwap(const std::string& device_id, int channels, boo
 
 void PlayerCore::ApplyDeckRouting(Deck* deck) {
   if (!deck->amix_pad) return;
-  SetPadMatrix(deck->amix_pad, deck->branch_channels, output_channels_, deck->channel_routes);
+  AudioBus* b = deck->surface && deck->surface->bus ? deck->surface->bus : main_bus_.get();
+  SetPadMatrix(deck->amix_pad, deck->branch_channels, b->channels, deck->channel_routes);
+}
+
+void PlayerCore::SetWindowMute(int window_id, bool muted) {
+  Surface* s = GetSurface(window_id);
+  if (!s) return;
+  s->muted = muted;
+  const gboolean m = muted ? TRUE : FALSE;
+  // 해제 시엔 현재 라이브 덱만 되살린다 — 스왑 중 퇴장하는 덱(이미 mute)은 되살리지 않음.
+  for (auto& d : s->decks) {
+    if (!d || !d->amix_pad) continue;
+    if (muted || d->id == s->live_deck) g_object_set(d->amix_pad, "mute", m, nullptr);
+  }
+  if (s->live.amix_pad) g_object_set(s->live.amix_pad, "mute", m, nullptr);
+  for (auto& [id, t] : audio_tracks_)
+    if (t && t->window_id == window_id && t->amix_pad)
+      g_object_set(t->amix_pad, "mute", m, nullptr);
+  feedback_("window_mute", json{{"window_id", window_id}, {"muted", muted}});
 }
 
 void PlayerCore::SetDeckAudio(const json& msg, int window_id) {
@@ -3051,6 +3313,12 @@ void PlayerCore::AudioTrackPlay(const json& msg) {
   track->core = this;
   track->id = id;
   track->file = file;
+  // 창 귀속 오디오(윈도우 모드 항목 오디오 등): 그 창의 출력 디바이스 버스로. 미지정/없는 창 = main.
+  {
+    Surface* ws = msg.contains("window_id") ? GetSurface(msg.value("window_id", -1)) : nullptr;
+    track->bus = ws && ws->bus ? ws->bus : main_bus_.get();
+    track->window_id = ws ? ws->id : -1;
+  }
   track->loop = msg.value("loop", false);
   track->delay_ms = std::max<gint64>(0, msg.value("delay_ms", static_cast<int64_t>(0)));
   track->in_ms = msg.contains("in_ms") ? msg.value("in_ms", static_cast<gint64>(0))
@@ -3158,8 +3426,10 @@ void PlayerCore::ConnectAudioTrack(AudioTrack* track) {
   gst_pad_set_active(track->ghost, TRUE);
   gst_element_add_pad(track->bin, track->ghost);
 
-  track->amix_pad = gst_element_request_pad_simple(amix_, "sink_%u");
-  SetPadMatrix(track->amix_pad, track->branch_channels, output_channels_, track->channel_routes);
+  track->amix_pad = gst_element_request_pad_simple(track->bus->amix, "sink_%u");
+  if (const Surface* ws = GetSurface(track->window_id); ws && ws->muted)
+    g_object_set(track->amix_pad, "mute", TRUE, nullptr);  // 창 귀속 트랙: 창 뮤트 유지
+  SetPadMatrix(track->amix_pad, track->branch_channels, track->bus->channels, track->channel_routes);
   gst_pad_set_offset(track->out, static_cast<gint64>(RunningTime()));
   if (gst_pad_link(track->ghost, track->amix_pad) != GST_PAD_LINK_OK) {
     feedback_("error", "audio track: link to mixer failed");
@@ -3251,7 +3521,8 @@ void PlayerCore::AudioTrackSetChannelMap(const std::string& track_id, const json
     }
   }
   if (track->amix_pad) {
-    SetPadMatrix(track->amix_pad, track->branch_channels, output_channels_, track->channel_routes);
+    SetPadMatrix(track->amix_pad, track->branch_channels, track->bus->channels,
+                 track->channel_routes);
   }
 }
 
@@ -3280,12 +3551,14 @@ void PlayerCore::TeardownAudioTrack(const std::string& track_id) {
   gst_element_set_state(track->bin, GST_STATE_NULL);
   if (track->amix_pad) {
     if (track->ghost) gst_pad_unlink(track->ghost, track->amix_pad);
-    gst_element_release_request_pad(amix_, track->amix_pad);
+    gst_element_release_request_pad(track->bus->amix, track->amix_pad);
     gst_object_unref(track->amix_pad);
   }
   if (track->out) gst_object_unref(track->out);
   gst_bin_remove(GST_BIN(pipeline_), track->bin);
+  AudioBus* bus = track->bus;
   audio_tracks_.erase(it);
+  ReleaseBusIfUnused(bus);  // 창이 먼저 사라진 뒤 남아 있던 트랙이 마지막 사용자였던 경우
 }
 
 void PlayerCore::EmitAudioTrackData(AudioTrack* track, const char* state) {

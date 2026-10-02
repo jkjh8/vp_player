@@ -9,6 +9,7 @@ constexpr wchar_t kClassName[] = L"vplayerVideoWindow";
 constexpr UINT WM_APP_FULLSCREEN = WM_APP + 1;  // wParam: 0/1
 constexpr UINT WM_APP_DESTROY = WM_APP + 2;
 constexpr UINT WM_APP_PLACEMENT = WM_APP + 3;  // lParam: WindowPlacement* (수신측이 delete)
+constexpr UINT WM_APP_RERESOLVE = WM_APP + 4;  // 모니터 구성 변경 → 마지막 요청 배치 재해석
 // 사이니지 출력창: 제목 표시줄/테두리 없는 borderless (비-전체화면 상태에서도). 배치는
 // 호스트 명령(set_display)으로만 하므로 캡션/리사이즈 프레임이 필요 없다. WS_POPUP은
 // 프레임이 없어 창 rect == 클라이언트 rect (AdjustWindowRect는 사실상 no-op).
@@ -17,27 +18,35 @@ constexpr DWORD kWindowedStyle = WS_POPUP;
 
 VideoWindow::~VideoWindow() { Destroy(); }
 
-RECT VideoWindow::ResolvePlacementRect(const WindowPlacement& placement) const {
+bool VideoWindow::ResolveMonitor(const std::vector<MonitorInfo>& monitors,
+                                 const WindowPlacement& placement, MonitorInfo* out) {
+  if (!placement.monitor_key.empty() || !placement.monitor_serial.empty()) {
+    const MonitorInfo* m = FindMonitorByKey(monitors, placement.monitor_key, placement.monitor_serial);
+    if (!m) return false;
+    *out = *m;
+    return true;
+  }
+  for (const auto& m : monitors)
+    if (m.index == placement.monitor_index) return *out = m, true;
+  for (const auto& m : monitors)
+    if (m.primary) return *out = m, true;
+  if (monitors.empty()) return false;
+  *out = monitors.front();
+  return true;
+}
+
+RECT VideoWindow::ResolvePlacementRect(const WindowPlacement& placement, bool* found) const {
   const auto monitors = EnumerateMonitors();
   MonitorInfo mon;
-  bool found = false;
-  for (const auto& m : monitors) {
-    if (m.index == placement.monitor_index) {
-      mon = m;
-      found = true;
-      break;
-    }
+  *found = ResolveMonitor(monitors, placement, &mon);
+  if (!*found) {
+    // 대상 모니터 없음 → 창은 숨김 처리. 크기 계산용으로만 주 모니터 기준 rect.
+    WindowPlacement fallback = placement;
+    fallback.monitor_key.clear();
+    fallback.monitor_serial.clear();
+    fallback.monitor_index = -1;
+    ResolveMonitor(monitors, fallback, &mon);
   }
-  if (!found) {
-    for (const auto& m : monitors) {
-      if (m.primary) {
-        mon = m;
-        found = true;
-        break;
-      }
-    }
-  }
-  if (!found && !monitors.empty()) mon = monitors.front();
 
   const int w = placement.width > 0 ? placement.width : mon.width;
   const int h = placement.height > 0 ? placement.height : mon.height;
@@ -68,6 +77,8 @@ WindowPlacement VideoWindow::CurrentPlacement() const {
   for (const auto& m : monitors) {
     if (m.x == mi.rcMonitor.left && m.y == mi.rcMonitor.top) {
       p.monitor_index = m.index;
+      p.monitor_key = m.key;
+      p.monitor_serial = m.serial;
       mon_x = m.x;
       mon_y = m.y;
       break;
@@ -118,8 +129,21 @@ void VideoWindow::ApplyPlacement(const WindowPlacement& placement) {
   PostMessageW(hwnd_, WM_APP_PLACEMENT, 0, reinterpret_cast<LPARAM>(copy));
 }
 
+void VideoWindow::Reresolve() {
+  if (hwnd_) PostMessageW(hwnd_, WM_APP_RERESOLVE, 0, 0);
+}
+
 void VideoWindow::ApplyPlacementOnThread(const WindowPlacement& placement) {
-  const RECT target = ResolvePlacementRect(placement);
+  requested_ = placement;
+  bool found = true;
+  const RECT target = ResolvePlacementRect(placement, &found);
+  if (!found) {
+    // 대상 모니터 미연결: 주 모니터로 떨구지 않고 숨긴 채 대기 (연결되면 Reresolve로 복귀)
+    detached_ = true;
+    ShowWindow(hwnd_, SW_HIDE);
+    return;
+  }
+  const bool was_detached = detached_.exchange(false);
   client_width_ = target.right - target.left;
   client_height_ = target.bottom - target.top;
 
@@ -135,7 +159,8 @@ void VideoWindow::ApplyPlacementOnThread(const WindowPlacement& placement) {
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
   } else {
     SetWindowPos(hwnd_, nullptr, outer.left, outer.top, outer.right - outer.left,
-                 outer.bottom - outer.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                 outer.bottom - outer.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | (was_detached ? SWP_SHOWWINDOW : 0));
   }
 }
 
@@ -151,13 +176,18 @@ void VideoWindow::ThreadMain(WindowPlacement placement, HANDLE ready_event) {
   wc.lpszClassName = kClassName;
   RegisterClassExW(&wc);
 
-  const RECT target = ResolvePlacementRect(placement);
+  requested_ = placement;
+  bool found = true;
+  const RECT target = ResolvePlacementRect(placement, &found);
+  detached_ = !found;  // 대상 모니터 미연결이면 숨긴 채 생성 (연결 시 Reresolve로 표시)
   client_width_ = target.right - target.left;
   client_height_ = target.bottom - target.top;
 
   RECT rect = target;
   AdjustWindowRect(&rect, kWindowedStyle, FALSE);
-  hwnd_ = CreateWindowExW(0, kClassName, L"VP Player", kWindowedStyle | WS_VISIBLE,
+  windowed_rect_ = rect;
+  hwnd_ = CreateWindowExW(0, kClassName, L"VP Player",
+                          kWindowedStyle | (found ? WS_VISIBLE : 0),
                           rect.left, rect.top, rect.right - rect.left,
                           rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, this);
   SetEvent(ready_event);
@@ -179,6 +209,11 @@ void VideoWindow::ToggleFullscreenFromKey() {
 void VideoWindow::ApplyFullscreen(bool fullscreen) {
   if (fullscreen == fullscreen_) return;
   fullscreen_ = fullscreen;
+  // 숨김(모니터 미연결) 중에는 상태만 기록 — 모니터 복귀 시 ApplyPlacementOnThread가 반영.
+  if (detached_) {
+    if (!fullscreen) SetWindowLongPtrW(hwnd_, GWL_STYLE, kWindowedStyle);
+    return;
+  }
 
   if (fullscreen) {
     GetWindowRect(hwnd_, &windowed_rect_);
@@ -218,6 +253,9 @@ LRESULT CALLBACK VideoWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_FULLSCREEN:
       if (self) self->ApplyFullscreen(wp != 0);
       return 0;
+    case WM_APP_RERESOLVE:
+      if (self) self->ApplyPlacementOnThread(self->requested_);
+      return 0;
     case WM_APP_PLACEMENT: {
       auto* placement = reinterpret_cast<WindowPlacement*>(lp);
       if (self) self->ApplyPlacementOnThread(*placement);
@@ -235,7 +273,9 @@ LRESULT CALLBACK VideoWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
       // 사용자가 창을 직접 이동/리사이즈한 뒤 놓는 시점 — 실제 배치를 호스트로 역보고.
       // 풀스크린 상태(WS_POPUP)에서는 사용자 조작 배치가 무의미하므로 제외.
       if (self && self->on_placement_change_ && !self->fullscreen_) {
-        self->on_placement_change_(self->CurrentPlacement());
+        const WindowPlacement p = self->CurrentPlacement();
+        self->requested_ = p;  // 사용자가 옮긴 위치가 이후 Reresolve의 기준
+        self->on_placement_change_(p);
       }
       break;
     case WM_SETCURSOR:

@@ -5,13 +5,20 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <thread>
+
+#include "video/display_enum.h"
 
 namespace vp {
 
 // 창을 배치할 모니터/좌표/크기. width/height=0은 모니터 작업영역 전체 크기를 의미.
 struct WindowPlacement {
-  int monitor_index = -1;  // -1 = primary
+  int monitor_index = -1;  // -1 = primary (monitor_key 지정 시 무시 — 순번은 부팅마다 밀릴 수 있음)
+  // 물리 모니터 고정 식별자(MonitorInfo::key) + 폴백용 EDID 시리얼. 지정 시 이것으로 모니터를 찾고,
+  // 연결돼 있지 않으면 창을 숨긴 채 대기한다(주 모니터로 옮기지 않음) → 연결되면 자동 복귀.
+  std::string monitor_key;
+  std::string monitor_serial;
   int x = 0, y = 0;        // 모니터 좌상단 기준 오프셋
   int width = 0, height = 0;
 };
@@ -53,6 +60,15 @@ class VideoWindow {
   void SetBackgroundColor(uint32_t rgb);  // 0xRRGGBB — 비디오 없을 때의 창 배경
   void Invalidate();  // 클라이언트 영역 다시 칠하기 요청 (레터박스 띠를 배경색으로 갱신)
   void ApplyPlacement(const WindowPlacement& placement);  // 라이브 재배치 (모니터/좌표/크기)
+  // 모니터 구성 변경 시 마지막 요청 배치를 다시 해석 (대상 모니터 연결 → 표시, 분리 → 숨김)
+  void Reresolve();
+  // 대상 모니터(monitor_key)가 연결돼 있지 않아 숨겨진 상태
+  bool IsDetached() const { return detached_; }
+
+  // 배치 → 대상 모니터. key 지정 시 key/serial로만 찾고(없으면 false), 미지정 시 index → primary →
+  // 첫 모니터 순 폴백(기존 동작).
+  static bool ResolveMonitor(const std::vector<MonitorInfo>& monitors,
+                             const WindowPlacement& placement, MonitorInfo* out);
 
   // 현재 배치된 클라이언트 영역 크기 (aspect-ratio 계산 등에 사용)
   int client_width() const { return client_width_; }
@@ -64,7 +80,8 @@ class VideoWindow {
   void ApplyFullscreen(bool fullscreen);
   void ToggleFullscreenFromKey();  // F11 — 창 스레드에서 직접 호출됨
   void ApplyPlacementOnThread(const WindowPlacement& placement);
-  RECT ResolvePlacementRect(const WindowPlacement& placement) const;  // 모니터 좌표 → 절대 클라이언트 rect
+  // 모니터 좌표 → 절대 클라이언트 rect. 대상 모니터가 없으면 found=false (rect는 주 모니터 기준).
+  RECT ResolvePlacementRect(const WindowPlacement& placement, bool* found) const;
   WindowPlacement CurrentPlacement() const;  // 현재 창의 실제 배치(모니터 인덱스+클라이언트 좌표/크기)
 
   HWND hwnd_ = nullptr;
@@ -74,6 +91,8 @@ class VideoWindow {
   std::atomic<int> client_width_{1280};
   std::atomic<int> client_height_{720};
   RECT windowed_rect_{};  // 풀스크린 해제 시 복원용 (창 스레드에서만 접근)
+  WindowPlacement requested_;  // 마지막 요청 배치 (Reresolve 기준, 창 스레드에서만 접근)
+  std::atomic<bool> detached_{false};
   CloseHandler on_close_;
   FullscreenChangeHandler on_fullscreen_change_;
   PlacementChangeHandler on_placement_change_;

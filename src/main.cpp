@@ -45,6 +45,49 @@ void SendFeedback(const std::string& type, const json& data) {
   g_app->server.SendLine(msg.dump());
 }
 
+// 모니터 목록 피드백. key/name/serial = 물리 모니터 고정 식별(호스트가 창 설정에 영속),
+// index는 표시/레거시용 순번(연결 구성에 따라 밀림).
+void SendDisplays() {
+  json displays = json::array();
+  for (const auto& m : vp::EnumerateMonitors()) {
+    displays.push_back({{"index", m.index},
+                        {"device_name", m.device_name},
+                        {"key", m.key},
+                        {"name", m.name},
+                        {"serial", m.serial},
+                        {"x", m.x},
+                        {"y", m.y},
+                        {"width", m.width},
+                        {"height", m.height},
+                        {"primary", m.primary}});
+  }
+  SendFeedback("displays", json{{"displays", displays}});
+}
+
+// 모니터 구성 변경 감시 (2s 폴링 — 창이 없거나 숨김 상태여도 동작해야 해서 WM_DISPLAYCHANGE 대신).
+// 부팅 직후 늦게 켜지는 프로젝터/TV, 핫플러그, 배치 변경을 감지하면 모니터 목록을 다시 보내고
+// 전 창의 배치를 재해석한다(미연결로 숨겨둔 창이 제 모니터로 복귀). 창 상태는 창 스레드 적용 후 보고.
+gboolean OnDisplayPoll(gpointer) {
+  static std::string last;
+  std::string sig;
+  for (const auto& m : vp::EnumerateMonitors())
+    sig += m.key + "|" + m.serial + "|" + std::to_string(m.x) + "," + std::to_string(m.y) + "," +
+           std::to_string(m.width) + "x" + std::to_string(m.height) + (m.primary ? "P" : "") + ";";
+  if (last.empty()) {
+    last = sig;  // 최초 = 기준선 (시작 시 목록은 호스트의 get_displays로 이미 전달)
+    return G_SOURCE_CONTINUE;
+  }
+  if (sig == last) return G_SOURCE_CONTINUE;
+  last = sig;
+  SendDisplays();
+  g_app->core.RefreshPlacements();
+  g_timeout_add(500, [](gpointer) -> gboolean {
+    SendFeedback("windows", json{{"windows", g_app->core.ListSurfaces()}});
+    return G_SOURCE_REMOVE;
+  }, nullptr);
+  return G_SOURCE_CONTINUE;
+}
+
 // window_id 주소. 명시되면 그 값, 없으면 기본 창(존재하는 첫 창) — 주 창 개념 폐지.
 int WindowIdOf(const json& msg) {
   return msg.contains("window_id") ? msg.value("window_id", 0) : g_app->core.DefaultWindowId();
@@ -54,6 +97,8 @@ int WindowIdOf(const json& msg) {
 vp::WindowPlacement PlacementFromJson(const json& msg) {
   vp::WindowPlacement p;
   p.monitor_index = msg.value("monitor_index", -1);
+  p.monitor_key = msg.value("monitor_key", std::string());
+  p.monitor_serial = msg.value("monitor_serial", std::string());
   p.x = msg.value("x", 0);
   p.y = msg.value("y", 0);
   p.width = msg.value("width", 0);
@@ -89,9 +134,14 @@ void HandleCommand(const json& msg) {
 
   if (cmd == "create_window") {
     std::string aspect = msg.value("aspect_mode", std::string("letterbox"));
-    const bool ok = core.CreateSurface(wid, PlacementFromJson(msg), aspect);
+    const bool ok = core.CreateSurface(wid, PlacementFromJson(msg), aspect,
+                                       msg.value("audio_only", false),
+                                       msg.value("audio_device", std::string()));
+    if (ok && msg.value("muted", false)) core.SetWindowMute(wid, true);
     if (ok) core.SetWindowZOrder(wid, msg.value("z_order", 0));  // 생성 직후 z 스택 반영
     SendFeedback("windows", json{{"windows", core.ListSurfaces()}, {"created", wid}, {"ok", ok}});
+  } else if (cmd == "set_window_mute") {
+    core.SetWindowMute(wid, msg.value("muted", false));
   } else if (cmd == "destroy_window") {
     core.DestroySurface(wid);
     SendFeedback("windows", json{{"windows", core.ListSurfaces()}, {"destroyed", wid}});
@@ -175,17 +225,7 @@ void HandleCommand(const json& msg) {
       SendFeedback("error", "background_color: invalid color: " + msg.value("color", ""));
     }
   } else if (cmd == "get_displays") {
-    json displays = json::array();
-    for (const auto& m : vp::EnumerateMonitors()) {
-      displays.push_back({{"index", m.index},
-                          {"device_name", m.device_name},
-                          {"x", m.x},
-                          {"y", m.y},
-                          {"width", m.width},
-                          {"height", m.height},
-                          {"primary", m.primary}});
-    }
-    SendFeedback("displays", json{{"displays", displays}});
+    SendDisplays();
   } else if (cmd == "set_display") {
     vp::WindowPlacement p = PlacementFromJson(msg);
     core.ApplyDisplayPlacement(p, wid);
@@ -194,12 +234,10 @@ void HandleCommand(const json& msg) {
     // 생긴다 — aspect-ratio 계산에 쓸 목표 크기는 여기서 직접 재계산한다.
     int target_w = p.width, target_h = p.height;
     if (target_w <= 0 || target_h <= 0) {
-      for (const auto& m : vp::EnumerateMonitors()) {
-        if (m.index == p.monitor_index || (p.monitor_index < 0 && m.primary)) {
-          if (target_w <= 0) target_w = m.width;
-          if (target_h <= 0) target_h = m.height;
-          break;
-        }
+      vp::MonitorInfo m;
+      if (vp::VideoWindow::ResolveMonitor(vp::EnumerateMonitors(), p, &m)) {
+        if (target_w <= 0) target_w = m.width;
+        if (target_h <= 0) target_h = m.height;
       }
     }
     const std::string aspect_mode = msg.value("aspect_mode", std::string("letterbox"));
@@ -345,7 +383,8 @@ gboolean SendReady(gpointer) {
                                "display", "timeline", "multi_window", "track_delay",
                                "memory_status", "ptp_sync", "net_clock", "channel_delay",
                                "play_synced", "preload_status", "hwaccel", "hw_only",
-                               "master_volume", "live_source"});
+                               "master_volume", "live_source", "audio_only_window",
+                               "window_audio_device", "window_mute"});
   if (HasNdiRuntime()) features.push_back("live_ndi");  // NDI 런타임 설치된 경우에만
   SendFeedback("capabilities", json{{"features", features}});
   // HW 가속 실효 상태 보고 (요청 enabled vs 실효 render — d3d11 프로브 실패 시 다를 수 있음).
@@ -543,6 +582,7 @@ int main(int argc, char* argv[]) {
   g_timeout_add(100, OnTick, nullptr);
   g_timeout_add(1000, OnMemoryTick, nullptr);
   g_timeout_add(500, SendReady, nullptr);
+  g_timeout_add(2000, OnDisplayPoll, nullptr);
 
   g_main_loop_run(app.loop);
 

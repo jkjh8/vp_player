@@ -96,15 +96,39 @@ struct PlayerCore::Deck {
   //  resource_error : filesrc 파일 열기 실패 (경로 없음/잠김 등)
   bool codec_error = false;
   bool resource_error = false;
+  // 오디오 전용 창에서 스트림 컬렉션에 오디오가 없음(영상 전용 파일/이미지) → 즉시 실패 보고.
+  std::atomic<bool> no_audio{false};
 };
 
 // ---------------------------------------------------------------------------
 // AudioTrack — 독립 오디오 트랙 (v2 §5). 전역 (창 개념 없음, 공유 amix).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// AudioBus — 출력 디바이스 1개 = 믹서 1개. amix ─ bus_caps(Nch) ─ convert ─ resample ─ vol ─ sink.
+// main 버스 = 전역 디바이스(set_audio_device). 창에 별도 디바이스가 지정되면 디바이스별 버스를
+// 만들어 그 창의 덱/라이브/창 귀속 오디오 트랙을 거기로 보낸다(같은 디바이스 창끼리 공유).
+// 무음 앵커로 소스가 없어도 sink가 클록을 유지. 채널 지연 라인은 main 버스에만 걸린다.
+// ---------------------------------------------------------------------------
+struct PlayerCore::AudioBus {
+  std::string device_id;        // "" = 시스템 기본 (main 버스 초기값)
+  bool is_main = false;
+  std::string sfx;              // 요소 이름 접미 (main = "")
+  GstElement* amix = nullptr;
+  GstElement* caps = nullptr;   // 버스 채널수 정책 지점
+  GstElement* vol = nullptr;    // 마스터 볼륨 (sink 교체 시 재연결 지점 = tail)
+  GstElement* sink = nullptr;   // wasapi2sink/asiosink (폴백: autoaudiosink/fakesink)
+  GstPad* silence_pad = nullptr;
+  int channels = 2;
+  bool positioned = true;       // false = unpositioned(asio)
+  bool fallback_active = false; // sink 열기 실패로 fakesink 대체 중
+};
+
 struct PlayerCore::AudioTrack {
   PlayerCore* core = nullptr;
   std::string id;
   nlohmann::json file;
+  AudioBus* bus = nullptr;  // 출력 버스 (window_id 지정 시 그 창의 버스, 아니면 main)
+  int window_id = -1;       // 창 귀속 트랙이면 그 창 id (창 뮤트 대상), 아니면 -1
 
   GstElement* bin = nullptr;
   GstElement* decode = nullptr;
@@ -183,6 +207,15 @@ struct PlayerCore::LiveSource {
 struct PlayerCore::Surface {
   PlayerCore* core = nullptr;
   int id = 0;
+  // 오디오 전용 창: Win32 창·comp/vsink/배경/로고를 만들지 않고 덱의 비디오 스트림은 디코드 단계에서
+  // 선택 해제한다(select-stream). 오디오만 전역 amix로. comp/vsink/hwnd/logo 포인터는 전부 nullptr.
+  bool audio_only = false;
+  // 오디오 출력 버스 (창별 디바이스 지정 시 디바이스 버스, 미지정 = main). 생성 시 고정 —
+  // 디바이스 변경은 호스트가 창을 재생성한다. 소유는 PlayerCore(main_bus_/device_buses_).
+  AudioBus* bus = nullptr;
+  // 창 오디오 전체 뮤트 (덱 임베디드 + 라이브 입력 + 창 귀속 오디오 트랙). amix 패드 mute로 적용 —
+  // 트랙별 볼륨/뮤트 설정과 독립. set_window_mute.
+  bool muted = false;
   VideoWindow window;
   HWND hwnd = nullptr;
 
